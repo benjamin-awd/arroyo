@@ -16,7 +16,9 @@ use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::Sender;
+use tracing::info;
 use typify::import_types;
 
 pub mod sink;
@@ -38,6 +40,33 @@ import_types!(schema = "src/nats/table.json");
 pub struct NatsState {
     stream_name: String,
     stream_sequence_number: u64,
+    idle_heartbeat_timer: Option<u64>,
+}
+
+impl NatsState {
+    fn set_heartbeat_timer(&mut self) {
+        self.idle_heartbeat_timer = Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
+    }
+
+    fn check_heartbeat_timeout(&self, timeout: u64) -> bool {
+        if let Some(timer) = self.idle_heartbeat_timer {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            info!(
+                "Checking if {} > {}",
+                now, timer + timeout
+            );
+            return now > timer + timeout;
+        }
+        false
+    }
 }
 
 pub struct NatsConnector {}

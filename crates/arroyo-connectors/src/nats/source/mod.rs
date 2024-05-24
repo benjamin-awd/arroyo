@@ -24,8 +24,7 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 use std::time::SystemTime;
 use tokio::select;
-use tracing::debug;
-use tracing::info;
+use tracing::{debug, info};
 
 pub struct NatsSourceFunc {
     pub source_type: SourceType,
@@ -407,7 +406,8 @@ impl NatsSourceFunc {
                                         ctx.task_info.operator_id.clone(),
                                         NatsState {
                                             stream_name: stream.clone(),
-                                            stream_sequence_number: message_info.stream_sequence.clone()
+                                            stream_sequence_number: message_info.stream_sequence.clone(),
+                                            idle_heartbeat_timer: None,
                                         }
                                     );
 
@@ -424,8 +424,17 @@ impl NatsSourceFunc {
                                 Some(Err(msg)) => {
                                     match msg.kind() {
                                         consumer::pull::MessagesErrorKind::MissingHeartbeat => {
-                                            // https://github.com/nats-io/nats.rs/discussions/1102#discussioncomment-9298901
-                                            info!("NATS error: {}", msg.to_string());
+                                            let operator_id = ctx.task_info.operator_id.clone();
+                                            if let Some(state) = sequence_numbers.get_mut(&operator_id) {
+                                                if state.check_heartbeat_timeout(600) {
+                                                    return Err(UserError::new("Idle heartbeat timeout: no message received in the last 600 seconds", msg.to_string()));
+                                                } else {
+                                                    if state.idle_heartbeat_timer.is_none() {
+                                                        info!("Starting idle heartbeat timer");
+                                                        state.set_heartbeat_timer();
+                                                    }
+                                                }
+                                            }
                                         },
                                         _ => {
                                             return Err(UserError::new("NATS error", msg.to_string()));
