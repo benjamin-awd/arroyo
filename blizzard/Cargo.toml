@@ -1,0 +1,59 @@
+[package]
+name = "blizzard"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A standalone tool for streaming NDJSON.gz files to Delta Lake with checkpoint-based recovery"
+license = "MIT OR Apache-2.0"
+
+# This makes the package standalone, not part of the arroyo workspace
+[workspace]
+
+[dependencies]
+# Arrow ecosystem (latest)
+arrow = { version = "55", features = ["chrono-tz"] }
+arrow-json = "55"
+parquet = { version = "55", features = ["async"] }
+
+# Delta Lake (latest)
+deltalake = { version = "0.30", features = ["s3", "gcs", "azure"] }
+
+# Object storage (patched fork for GCS Content-Length header fix)
+object_store = { git = "https://github.com/benjamin-awd/arrow-rs-object-store", branch = "0.12.5/gcs-content-length", features = ["aws", "gcp", "azure"] }
+aws-config = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["io-util"] }
+tokio-util = { version = "0.7", features = ["io"] }
+async-compression = { version = "0.4", features = ["tokio", "gzip", "zstd"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# URL parsing and glob matching
+url = "2"
+regex = "1"
+glob = "0.3"
+
+# Misc
+bytes = "1"
+uuid = { version = "1", features = ["v7"] }
+chrono = "0.4"
+
+[dev-dependencies]
+tempfile = "3.24.0"
