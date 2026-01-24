@@ -19,4 +19,7 @@ pub struct FinishedFile {
     pub size: usize,
     /// Number of records in the file.
     pub record_count: usize,
+    /// The parquet file bytes (to be uploaded to storage).
+    /// None if the file was already uploaded (e.g., from checkpoint recovery).
+    pub bytes: Option<bytes::Bytes>,
 }

@@ -3,6 +3,7 @@
 use arrow::array::{BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use rand::Rng;
+use std::io::Write;
 use std::sync::Arc;
 
 use blizzard::checkpoint::{CheckpointState, PendingFile};
@@ -49,6 +50,28 @@ pub fn generate_json_lines(count: usize) -> Vec<String> {
             )
         })
         .collect()
+}
+
+/// Generate a gzip-compressed NDJSON file for I/O benchmarks.
+/// Returns the path to the temporary file.
+pub fn generate_ndjson_gz_file(count: usize) -> tempfile::NamedTempFile {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+
+    let lines = generate_json_lines(count);
+    let file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+
+    let mut encoder = GzEncoder::new(
+        std::fs::File::create(file.path()).expect("Failed to create file"),
+        Compression::fast(),
+    );
+
+    for line in &lines {
+        writeln!(encoder, "{}", line).expect("Failed to write line");
+    }
+
+    encoder.finish().expect("Failed to finish compression");
+    file
 }
 
 /// Generate Arrow RecordBatches for Parquet benchmarks.

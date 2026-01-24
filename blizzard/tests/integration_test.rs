@@ -406,6 +406,7 @@ mod sink_tests {
             filename: "data-001.parquet".to_string(),
             size: 1024 * 1024,
             record_count: 10000,
+            bytes: None,
         };
 
         assert_eq!(file.filename, "data-001.parquet");

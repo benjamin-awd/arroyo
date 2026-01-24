@@ -29,6 +29,11 @@ tokio-util = { version = "0.7", features = ["io"] }
 async-compression = { version = "0.4", features = ["tokio", "gzip", "zstd"] }
 futures = "0.3"
 
+# Parallel processing
+rayon = "1.10"
+flate2 = "1"
+zstd = "0.13"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -57,8 +62,12 @@ chrono = "0.4"
 
 [dev-dependencies]
 tempfile = "3.24.0"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 rand = "0.8"
+flate2 = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+rayon = "1.10"
+bytes = "1"
 
 [[bench]]
 name = "blizzard_benchmarks"

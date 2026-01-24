@@ -265,16 +265,18 @@ impl ParquetWriter {
         }
 
         // Check rolling policies
-        if self
-            .config
-            .rolling_policies
-            .iter()
-            .any(|p| p.should_roll(&self.stats))
-        {
+        // Use current_file_size for SizeLimit (includes buffer + in-progress data)
+        let current_size = self.current_file_size();
+        let should_roll = self.config.rolling_policies.iter().any(|p| match p {
+            RollingPolicy::SizeLimit(limit) => current_size >= *limit,
+            _ => p.should_roll(&self.stats),
+        });
+
+        if should_roll {
             tracing::info!(
-                "Rolling file due to policy: bytes_written={} ({:.2} MB), records={}, first_write={:?} ago, last_write={:?} ago",
-                self.stats.bytes_written,
-                self.stats.bytes_written as f64 / 1024.0 / 1024.0,
+                "Rolling file due to policy: current_size={} ({:.2} MB), records={}, first_write={:?} ago, last_write={:?} ago",
+                current_size,
+                current_size as f64 / 1024.0 / 1024.0,
                 self.stats.records_written,
                 self.stats.first_write_at.elapsed(),
                 self.stats.last_write_at.elapsed()
@@ -290,16 +292,24 @@ impl ParquetWriter {
         let writer = self.writer.take().expect("Writer should be available");
         writer.close()?;
 
-        // Create finished file record
+        // Capture the bytes before replacing the buffer
+        let bytes = std::mem::replace(
+            &mut self.buffer,
+            SharedBuffer::new(64 * 1024 * 1024), // 64MB initial capacity
+        )
+        .into_inner()
+        .freeze();
+
+        // Create finished file record with bytes
         let finished = FinishedFile {
             filename: self.current_file_name.clone(),
-            size: self.buffer.len(),
+            size: bytes.len(),
             record_count: self.stats.records_written,
+            bytes: Some(bytes),
         };
         self.finished_files.push(finished);
 
         // Reset for next file
-        self.buffer = SharedBuffer::new(64 * 1024 * 1024); // 64MB initial capacity
         self.writer = Some(Self::create_writer(
             &self.schema,
             &self.config,
@@ -332,23 +342,24 @@ impl ParquetWriter {
     }
 
     /// Close the current file and get all finished files.
-    pub fn close(mut self) -> Result<(Vec<FinishedFile>, Option<Bytes>)> {
+    /// All files include their parquet bytes for uploading to storage.
+    pub fn close(mut self) -> Result<Vec<FinishedFile>> {
         if self.stats.records_written > 0 {
             let writer = self.writer.take().expect("Writer should be available");
             writer.close()?;
 
+            let bytes = self.buffer.into_inner().freeze();
+
             let finished = FinishedFile {
                 filename: self.current_file_name.clone(),
-                size: self.buffer.len(),
+                size: bytes.len(),
                 record_count: self.stats.records_written,
+                bytes: Some(bytes),
             };
             self.finished_files.push(finished);
-
-            let bytes = self.buffer.into_inner().freeze();
-            Ok((self.finished_files, Some(bytes)))
-        } else {
-            Ok((self.finished_files, None))
         }
+
+        Ok(self.finished_files)
     }
 
     /// Take finished files without closing.

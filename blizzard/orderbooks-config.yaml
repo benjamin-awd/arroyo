@@ -1,12 +1,12 @@
 source:
   path: "gs://data-dev-596660_data_backup_processed/region=asia-northeast1/auth_type=public/subject=orderbooks/version=v1"
   compression: gzip
+  max_concurrent_files: 16
 
 sink:
   path: "gs://data-dev-596660-iceberg-test/delta/src_flowdesk_public__orderbooks_v1"
   file_size_mb: 128
   compression: snappy
-  max_concurrent_files: 100
 
 checkpoint:
   path: "gs://data-dev-596660-iceberg-test/delta/src_flowdesk_public__orderbooks_v1/_checkpoints"

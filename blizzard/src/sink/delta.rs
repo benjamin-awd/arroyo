@@ -80,6 +80,7 @@ impl DeltaSink {
             filename: filename.to_string(),
             size: bytes.len(),
             record_count,
+            bytes: None, // Already uploaded above
         };
 
         let version = self
@@ -362,6 +363,7 @@ mod tests {
             filename: "test-file.parquet".to_string(),
             size: 1024,
             record_count: 100,
+            bytes: None,
         };
 
         let action = create_add_action(&file);
@@ -382,6 +384,7 @@ mod tests {
             filename: "/path/to/file.parquet".to_string(),
             size: 2048,
             record_count: 200,
+            bytes: None,
         };
 
         let action = create_add_action(&file);

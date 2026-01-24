@@ -48,7 +48,7 @@ fn default_batch_size() -> usize {
 }
 
 fn default_max_concurrent_files() -> usize {
-    4
+    16
 }
 
 /// Sink configuration for writing to Delta Lake.
