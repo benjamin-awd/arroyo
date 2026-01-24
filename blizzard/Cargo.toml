@@ -18,8 +18,8 @@ parquet = { version = "55", features = ["async"] }
 # Delta Lake (latest)
 deltalake = { version = "0.30", features = ["s3", "gcs", "azure"] }
 
-# Object storage (patched fork for GCS Content-Length header fix)
-object_store = { git = "https://github.com/benjamin-awd/arrow-rs-object-store", branch = "0.12.5/gcs-content-length", features = ["aws", "gcp", "azure"] }
+# Object storage (patched via [patch.crates-io] for GCS Content-Length header fix)
+object_store = { version = "0.12.5", features = ["aws", "gcp", "azure"] }
 aws-config = "1"
 
 # Async runtime
@@ -72,3 +72,6 @@ bytes = "1"
 [[bench]]
 name = "blizzard_benchmarks"
 harness = false
+
+[patch.crates-io]
+object_store = { git = "https://github.com/benjamin-awd/arrow-rs-object-store", branch = "0.12.5/gcs-content-length" }

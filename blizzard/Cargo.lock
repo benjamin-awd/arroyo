@@ -1032,7 +1032,7 @@ dependencies = [
  "flate2",
  "futures",
  "glob",
- "object_store 0.12.5 (git+https://github.com/benjamin-awd/arrow-rs-object-store?branch=0.12.5%2Fgcs-content-length)",
+ "object_store",
  "parquet 55.2.0",
  "rand 0.8.5",
  "rayon",
@@ -1563,7 +1563,7 @@ dependencies = [
  "futures",
  "indexmap",
  "itertools 0.14.0",
- "object_store 0.12.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "object_store",
  "parquet 57.2.0",
  "reqwest",
  "roaring",
@@ -1621,7 +1621,7 @@ dependencies = [
  "chrono",
  "deltalake-core",
  "futures",
- "object_store 0.12.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "object_store",
  "regex",
  "thiserror",
  "tokio",
@@ -1639,7 +1639,7 @@ checksum = "b8d28cb05f3254ddbcef665ee900f36bb6a34728d4ececb5f177cfdf2383f142"
 dependencies = [
  "bytes",
  "deltalake-core",
- "object_store 0.12.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "object_store",
  "thiserror",
  "tokio",
  "url",
@@ -1676,7 +1676,7 @@ dependencies = [
  "indexmap",
  "itertools 0.14.0",
  "num_cpus",
- "object_store 0.12.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "object_store",
  "parking_lot",
  "parquet 57.2.0",
  "percent-encoding",
@@ -1719,7 +1719,7 @@ dependencies = [
  "bytes",
  "deltalake-core",
  "futures",
- "object_store 0.12.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "object_store",
  "thiserror",
  "tokio",
  "tracing",
@@ -2810,44 +2810,6 @@ dependencies = [
 [[package]]
 name = "object_store"
 version = "0.12.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbfbfff40aeccab00ec8a910b57ca8ecf4319b335c542f2edcd19dd25a1e2a00"
-dependencies = [
- "async-trait",
- "base64",
- "bytes",
- "chrono",
- "form_urlencoded",
- "futures",
- "http 1.4.0",
- "http-body-util",
- "httparse",
- "humantime",
- "hyper 1.8.1",
- "itertools 0.14.0",
- "md-5",
- "parking_lot",
- "percent-encoding",
- "quick-xml",
- "rand 0.9.2",
- "reqwest",
- "ring",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "thiserror",
- "tokio",
- "tracing",
- "url",
- "walkdir",
- "wasm-bindgen-futures",
- "web-time",
-]
-
-[[package]]
-name = "object_store"
-version = "0.12.5"
 source = "git+https://github.com/benjamin-awd/arrow-rs-object-store?branch=0.12.5%2Fgcs-content-length#7b21a3cf7353e77d009d6c096bf371ee0fbd8751"
 dependencies = [
  "async-trait",
@@ -3011,7 +2973,7 @@ dependencies = [
  "num-bigint",
  "num-integer",
  "num-traits",
- "object_store 0.12.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "object_store",
  "paste",
  "seq-macro",
  "simdutf8",
