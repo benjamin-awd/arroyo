@@ -6,7 +6,7 @@
 use anyhow::Result;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{BufMut, BytesMut};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{GzipLevel, ZstdLevel};
 use parquet::file::properties::WriterProperties;
@@ -322,25 +322,6 @@ impl ParquetWriter {
         Ok(())
     }
 
-    /// Get the current file's bytes for checkpointing.
-    /// Returns the bytes and trailing footer that would make a valid Parquet file.
-    pub fn get_checkpoint_bytes(&mut self) -> Result<(Bytes, String)> {
-        let writer = self.writer.as_mut().expect("Writer should be available");
-        writer.flush()?;
-
-        // Get the current buffer content
-        let current_bytes = self
-            .buffer
-            .buffer
-            .lock()
-            .unwrap()
-            .get_ref()
-            .clone()
-            .freeze();
-
-        Ok((current_bytes, self.current_file_name.clone()))
-    }
-
     /// Close the current file and get all finished files.
     /// All files include their parquet bytes for uploading to storage.
     pub fn close(mut self) -> Result<Vec<FinishedFile>> {
@@ -367,21 +348,6 @@ impl ParquetWriter {
         std::mem::take(&mut self.finished_files)
     }
 
-    /// Get the current file name.
-    pub fn current_file_name(&self) -> &str {
-        &self.current_file_name
-    }
-
-    /// Get the number of records in the current file.
-    pub fn current_record_count(&self) -> usize {
-        self.stats.records_written
-    }
-
-    /// Get the number of records in the current row group.
-    pub fn current_row_group_records(&self) -> usize {
-        self.row_group_records
-    }
-
     /// Get the current file size in bytes (including in-progress data).
     pub fn current_file_size(&self) -> usize {
         let buffer_size = self.buffer.len();
@@ -391,54 +357,6 @@ impl ParquetWriter {
             .map(|w| w.in_progress_size())
             .unwrap_or(0);
         buffer_size + in_progress_size
-    }
-
-    /// Check if there are any unflushed bytes.
-    pub fn has_unflushed_data(&self) -> bool {
-        self.stats.records_written > 0
-    }
-
-    /// Get the current writer statistics.
-    pub fn stats(&self) -> &WriterStats {
-        &self.stats
-    }
-}
-
-/// Builder for creating Parquet file content.
-pub struct ParquetFileBuilder {
-    schema: SchemaRef,
-    config: ParquetWriterConfig,
-}
-
-impl ParquetFileBuilder {
-    /// Create a new builder.
-    pub fn new(schema: SchemaRef) -> Self {
-        Self {
-            schema,
-            config: ParquetWriterConfig::default(),
-        }
-    }
-
-    /// Set the compression.
-    pub fn with_compression(mut self, compression: ParquetCompression) -> Self {
-        self.config.compression = compression;
-        self
-    }
-
-    /// Build a Parquet file from batches.
-    pub fn build(self, batches: &[RecordBatch]) -> Result<Bytes> {
-        let buffer = SharedBuffer::new(64 * 1024 * 1024); // 64MB initial capacity
-        let writer_properties = ParquetWriter::writer_properties(&self.config);
-
-        let mut writer =
-            ArrowWriter::try_new(buffer.clone(), self.schema.clone(), Some(writer_properties))?;
-
-        for batch in batches {
-            writer.write(batch)?;
-        }
-
-        writer.close()?;
-        Ok(buffer.into_inner().freeze())
     }
 }
 
@@ -478,20 +396,6 @@ mod tests {
         let batch = test_batch(100);
         writer.write_batch(&batch).unwrap();
 
-        assert_eq!(writer.current_record_count(), 100);
         assert!(writer.current_file_size() > 0);
-    }
-
-    #[test]
-    fn test_parquet_file_builder() {
-        let schema = test_schema();
-        let batch = test_batch(10);
-
-        let bytes = ParquetFileBuilder::new(schema)
-            .with_compression(ParquetCompression::Snappy)
-            .build(&[batch])
-            .unwrap();
-
-        assert!(!bytes.is_empty());
     }
 }

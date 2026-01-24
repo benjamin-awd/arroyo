@@ -5,7 +5,6 @@
 
 use anyhow::Result;
 use arrow::datatypes::Schema;
-use bytes::Bytes;
 use deltalake::DeltaTable;
 use deltalake::kernel::Action;
 use deltalake::operations::create::CreateBuilder;
@@ -21,7 +20,6 @@ use crate::storage::{BackendConfig, StorageProvider, StorageProviderRef};
 /// Delta Lake sink for committing Parquet files.
 pub struct DeltaSink {
     table: DeltaTable,
-    storage: StorageProviderRef,
     last_version: i64,
 }
 
@@ -37,7 +35,6 @@ impl DeltaSink {
 
         Ok(Self {
             table,
-            storage,
             last_version,
         })
     }
@@ -64,48 +61,9 @@ impl DeltaSink {
         Ok(new_version)
     }
 
-    /// Write Parquet bytes to storage and commit to Delta.
-    pub async fn write_and_commit(
-        &mut self,
-        filename: &str,
-        bytes: Bytes,
-        record_count: usize,
-    ) -> Result<i64> {
-        // Write the file to storage
-        let path = Path::from(filename);
-        self.storage.put_bytes(&path, bytes.clone()).await?;
-
-        // Commit to Delta
-        let file = FinishedFile {
-            filename: filename.to_string(),
-            size: bytes.len(),
-            record_count,
-            bytes: None, // Already uploaded above
-        };
-
-        let version = self
-            .commit_files(&[file])
-            .await?
-            .expect("Should have committed");
-
-        Ok(version)
-    }
-
     /// Get the current table version.
     pub fn version(&self) -> i64 {
         self.last_version
-    }
-
-    /// Get the storage provider.
-    pub fn storage(&self) -> &StorageProvider {
-        &self.storage
-    }
-
-    /// Reload the table to get the latest version.
-    pub async fn reload(&mut self) -> Result<()> {
-        self.table.load().await?;
-        self.last_version = self.table.version().unwrap_or(-1);
-        Ok(())
     }
 }
 

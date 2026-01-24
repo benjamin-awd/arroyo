@@ -6,9 +6,6 @@ use rand::Rng;
 use std::io::Write;
 use std::sync::Arc;
 
-use blizzard::checkpoint::{CheckpointState, PendingFile};
-use blizzard::source::state::{FileReadState, SourceState};
-
 /// Returns a realistic schema with mixed types for benchmarking.
 ///
 /// Matches a typical orderbook-style schema:
@@ -153,38 +150,4 @@ pub fn generate_record_batches(batch_size: usize, num_batches: usize) -> Vec<Rec
             .expect("Failed to create RecordBatch")
         })
         .collect()
-}
-
-/// Generate checkpoint state for serialization benchmarks.
-///
-/// Creates a realistic checkpoint state with:
-/// - `files` number of tracked source files
-/// - `records_per_file` average records read per in-progress file
-pub fn generate_checkpoint_state(files: usize, records_per_file: usize) -> CheckpointState {
-    let mut rng = rand::thread_rng();
-    let mut source_state = SourceState::new();
-
-    // Create source file states - mix of finished and in-progress
-    for i in 0..files {
-        let path = format!("s3://bucket/input/file_{:05}.ndjson.gz", i);
-        if rng.gen_bool(0.3) {
-            // 30% finished
-            source_state.update_file(&path, FileReadState::Finished);
-        } else {
-            // 70% in progress with varying record counts
-            let records = rng.gen_range(records_per_file / 2..records_per_file * 2);
-            source_state.update_file(&path, FileReadState::RecordsRead(records));
-        }
-    }
-
-    // Create pending files (files written but not yet committed to Delta)
-    let num_pending = rng.gen_range(1..=5);
-    let pending_files: Vec<PendingFile> = (0..num_pending)
-        .map(|i| PendingFile {
-            filename: format!("01934567-89ab-cdef-0123-{:012x}.parquet", i),
-            record_count: rng.gen_range(50000..150000),
-        })
-        .collect();
-
-    CheckpointState::from_parts(source_state, pending_files, rng.gen_range(0..1000))
 }

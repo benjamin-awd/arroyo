@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
-use crate::checkpoint::{CheckpointCoordinator, PendingFile};
+use crate::checkpoint::CheckpointCoordinator;
 use crate::config::{CompressionFormat, Config};
 use crate::sink::FinishedFile;
 use crate::sink::delta::DeltaSink;
@@ -555,34 +555,6 @@ impl Pipeline {
         })
     }
 
-    /// Process a downloaded file: decompress and parse in rayon thread pool.
-    async fn process_downloaded_file(
-        &self,
-        downloaded: DownloadedFile,
-        compression: CompressionFormat,
-        schema: Arc<arrow::datatypes::Schema>,
-        batch_size: usize,
-    ) -> Result<ProcessedFile> {
-        let path = downloaded.path.clone();
-        let skip_records = downloaded.skip_records;
-        let compressed_data = downloaded.compressed_data;
-
-        // Run decompression + parsing in rayon thread pool via spawn_blocking
-        let result = tokio::task::spawn_blocking(move || {
-            Self::decompress_and_parse(
-                compressed_data,
-                compression,
-                schema,
-                batch_size,
-                skip_records,
-                &path,
-            )
-        })
-        .await??;
-
-        Ok(result)
-    }
-
     /// Decompress and parse a file's data (runs in rayon thread pool).
     fn decompress_and_parse(
         compressed: Bytes,
@@ -687,101 +659,6 @@ impl Pipeline {
             batches,
             total_records,
         })
-    }
-
-    /// Flush finished Parquet files to Delta Lake.
-    async fn flush_finished_files(
-        &mut self,
-        files: &[FinishedFile],
-        delta_sink: &mut DeltaSink,
-    ) -> Result<()> {
-        if files.is_empty() {
-            return Ok(());
-        }
-
-        // Upload parquet files to storage first (only if bytes are present)
-        for file in files {
-            if let Some(ref bytes) = file.bytes {
-                info!(
-                    "Uploading parquet file {} ({} bytes, {} records)",
-                    file.filename, file.size, file.record_count
-                );
-                self.sink_storage
-                    .put(file.filename.as_str(), bytes.to_vec())
-                    .await?;
-            }
-        }
-
-        // Add files to pending list
-        for file in files {
-            self.checkpoint_coordinator
-                .add_pending_file(PendingFile {
-                    filename: file.filename.clone(),
-                    record_count: file.record_count,
-                })
-                .await;
-        }
-
-        // Commit to Delta
-        if let Some(version) = delta_sink.commit_files(files).await? {
-            self.checkpoint_coordinator
-                .update_delta_version(version)
-                .await;
-            self.checkpoint_coordinator.clear_pending_files().await;
-            self.stats.delta_commits += 1;
-        }
-
-        self.stats.parquet_files_written += files.len();
-        self.stats.bytes_written += files.iter().map(|f| f.size).sum::<usize>();
-
-        Ok(())
-    }
-
-    /// Trigger a checkpoint.
-    async fn trigger_checkpoint(
-        &mut self,
-        writer: &mut ParquetWriter,
-        delta_sink: &mut DeltaSink,
-    ) -> Result<()> {
-        debug!("Triggering checkpoint");
-
-        // Flush any finished files first
-        let finished = writer.take_finished_files();
-        if !finished.is_empty() {
-            self.flush_finished_files(&finished, delta_sink).await?;
-        }
-
-        // Save checkpoint
-        self.checkpoint_coordinator.checkpoint().await?;
-        self.stats.checkpoints_saved += 1;
-
-        info!("Checkpoint saved");
-
-        Ok(())
-    }
-
-    /// Final flush at the end of processing.
-    async fn final_flush(
-        &mut self,
-        writer: ParquetWriter,
-        delta_sink: &mut DeltaSink,
-    ) -> Result<()> {
-        info!("Final flush - closing writer and committing to Delta");
-
-        // Close the writer and get all finished files including current file
-        let finished_files = writer.close()?;
-
-        if !finished_files.is_empty() {
-            info!("Flushing {} parquet files to Delta", finished_files.len());
-            self.flush_finished_files(&finished_files, delta_sink)
-                .await?;
-        }
-
-        // Save final checkpoint
-        self.checkpoint_coordinator.checkpoint().await?;
-        self.stats.checkpoints_saved += 1;
-
-        Ok(())
     }
 }
 

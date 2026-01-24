@@ -11,13 +11,12 @@ use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
-use object_store::{MultipartUpload, ObjectStore, PutPayload, RetryConfig, WriteMultipart};
+use object_store::{MultipartUpload, ObjectStore, PutPayload, RetryConfig};
 use regex::Regex;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tracing::debug;
-use url::Url;
 
 /// A reference-counted storage provider.
 pub type StorageProviderRef = Arc<StorageProvider>;
@@ -273,19 +272,9 @@ impl BackendConfig {
             BackendConfig::Local(local) => local.key.as_ref(),
         }
     }
-
-    /// Check if this is a local filesystem backend.
-    pub fn is_local(&self) -> bool {
-        matches!(self, BackendConfig::Local { .. })
-    }
 }
 
 impl StorageProvider {
-    /// Create a storage provider for the given URL.
-    pub async fn for_url(url: &str) -> Result<Self> {
-        Self::for_url_with_options(url, HashMap::new()).await
-    }
-
     /// Create a storage provider for the given URL with storage options.
     pub async fn for_url_with_options(url: &str, options: HashMap<String, String>) -> Result<Self> {
         let config = BackendConfig::parse_url(url, false)?;
@@ -479,19 +468,6 @@ impl StorageProvider {
         }
     }
 
-    /// Get a file as an async reader stream.
-    /// Returns a boxed reader for lifetime flexibility.
-    pub async fn get_as_stream(
-        &self,
-        path: impl Into<Path>,
-    ) -> Result<Box<dyn tokio::io::AsyncRead + Unpin + Send + 'static>> {
-        let path = path.into();
-        let path = self.qualify_path(&path);
-        let bytes = self.object_store.get(&path).await?.into_stream();
-
-        Ok(Box::new(tokio_util::io::StreamReader::new(bytes)))
-    }
-
     /// Put bytes to a path.
     pub async fn put(&self, path: impl Into<Path>, bytes: Vec<u8>) -> Result<()> {
         let bytes = PutPayload::from(Bytes::from(bytes));
@@ -502,79 +478,12 @@ impl StorageProvider {
         Ok(())
     }
 
-    /// Put bytes to a path.
-    pub async fn put_bytes(&self, path: &Path, bytes: Bytes) -> Result<()> {
-        let bytes = PutPayload::from(bytes);
-        let path = self.qualify_path(path);
-        self.object_store.put(&path, bytes).await?;
-
-        Ok(())
-    }
-
-    /// Put a payload to a path.
-    pub async fn put_payload(&self, path: &Path, payload: PutPayload) -> Result<()> {
-        let path = self.qualify_path(path);
-        self.object_store.put(&path, payload).await?;
-        Ok(())
-    }
-
     /// Qualify a path with the configured key prefix.
     pub fn qualify_path<'a>(&self, path: &'a Path) -> Cow<'a, Path> {
         match self.config.key() {
             Some(prefix) => Cow::Owned(prefix.parts().chain(path.parts()).collect()),
             None => Cow::Borrowed(path),
         }
-    }
-
-    /// Delete a file if present.
-    pub async fn delete_if_present(&self, path: impl Into<Path>) -> Result<()> {
-        let path = path.into();
-        let path = self.qualify_path(&path);
-        match self.object_store.delete(&path).await {
-            Ok(_) => Ok(()),
-            Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Start a multipart upload, returning a WriteMultipart handle.
-    ///
-    /// This is the preferred method for uploading large files as it allows
-    /// streaming data in parts without buffering the entire file in memory.
-    pub async fn start_multipart(&self, path: &Path) -> Result<Box<dyn MultipartUpload>> {
-        let path = self.qualify_path(path);
-        let upload = self.object_store.put_multipart(&path).await?;
-        Ok(upload)
-    }
-
-    /// Create a WriteMultipart for buffered multipart uploads.
-    ///
-    /// This provides a higher-level interface that handles part sizing and
-    /// upload coordination automatically.
-    pub async fn create_write_multipart(&self, path: &Path) -> Result<WriteMultipart> {
-        let path = self.qualify_path(path);
-        let upload = self.object_store.put_multipart(&path).await?;
-        Ok(WriteMultipart::new(upload))
-    }
-
-    /// Abort a multipart upload.
-    ///
-    /// Note: This requires having the MultipartUpload handle. If the handle
-    /// is lost (e.g., process crash), the upload will be automatically cleaned
-    /// up by the storage provider after some time (provider-specific).
-    pub async fn abort_multipart(&self, mut upload: Box<dyn MultipartUpload>) -> Result<()> {
-        upload.abort().await?;
-        Ok(())
-    }
-
-    /// Get the canonical URL for this storage location.
-    pub fn canonical_url(&self) -> &str {
-        &self.canonical_url
-    }
-
-    /// Get the canonical URL for a specific path.
-    pub fn canonical_url_for(&self, path: &str) -> String {
-        format!("{}/{}", self.canonical_url, path)
     }
 
     /// Get storage options for external integrations (e.g., Delta Lake).
@@ -587,14 +496,18 @@ impl StorageProvider {
         &self.config
     }
 
-    /// Get the underlying object store.
-    pub fn get_backing_store(&self) -> Arc<dyn ObjectStore> {
-        self.object_store.clone()
+    /// Put a payload to a path.
+    pub async fn put_payload(&self, path: &Path, payload: PutPayload) -> Result<()> {
+        let path = self.qualify_path(path);
+        self.object_store.put(&path, payload).await?;
+        Ok(())
     }
 
-    /// Parse a URL into a Url struct.
-    pub fn parse_url(&self) -> Result<Url> {
-        Ok(Url::parse(&self.canonical_url)?)
+    /// Start a multipart upload.
+    pub async fn start_multipart(&self, path: &Path) -> Result<Box<dyn MultipartUpload>> {
+        let path = self.qualify_path(path);
+        let upload = self.object_store.put_multipart(&path).await?;
+        Ok(upload)
     }
 }
 
@@ -705,7 +618,9 @@ mod tests {
 
         // Create storage provider pointing to the prefix
         let storage_url = format!("{}/{}", base_path.display(), prefix);
-        let storage = StorageProvider::for_url(&storage_url).await.unwrap();
+        let storage = StorageProvider::for_url_with_options(&storage_url, HashMap::new())
+            .await
+            .unwrap();
 
         // List files - should return relative paths (not including the prefix)
         let mut stream = storage.list(true).await.unwrap();
@@ -745,7 +660,9 @@ mod tests {
 
         // Storage provider at the partitions level
         let storage_url = format!("{}/partitions", base_path.display());
-        let storage = StorageProvider::for_url(&storage_url).await.unwrap();
+        let storage = StorageProvider::for_url_with_options(&storage_url, HashMap::new())
+            .await
+            .unwrap();
 
         // List files
         let mut stream = storage.list(true).await.unwrap();

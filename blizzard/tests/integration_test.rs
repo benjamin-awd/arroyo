@@ -90,7 +90,7 @@ schema:
             ("boolean", FieldType::Boolean, DataType::Boolean),
         ];
 
-        for (name, field_type, expected_arrow) in types {
+        for (name, _field_type, expected_arrow) in types {
             let yaml = format!(
                 r#"
 source:
@@ -188,108 +188,8 @@ mod storage_tests {
     }
 }
 
-mod source_tests {
-    use super::*;
-    use blizzard::source::reader::parse_json_line;
-
-    fn test_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("value", DataType::Int64, true),
-            Field::new("name", DataType::Utf8, true),
-        ]))
-    }
-
-    #[test]
-    fn test_parse_json_line_basic() {
-        let schema = test_schema();
-        let line = r#"{"id": "abc123", "value": 42, "name": "test"}"#;
-
-        let batch = parse_json_line(line, schema).unwrap();
-
-        assert_eq!(batch.num_rows(), 1);
-        assert_eq!(batch.num_columns(), 3);
-
-        let id_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(id_col.value(0), "abc123");
-
-        let value_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(value_col.value(0), 42);
-    }
-
-    #[test]
-    fn test_parse_json_line_null_values() {
-        let schema = test_schema();
-        let line = r#"{"id": "abc123"}"#;
-
-        let batch = parse_json_line(line, schema).unwrap();
-
-        assert_eq!(batch.num_rows(), 1);
-        assert!(batch.column(1).is_null(0)); // value is null
-        assert!(batch.column(2).is_null(0)); // name is null
-    }
-
-    #[test]
-    fn test_parse_json_line_extra_fields() {
-        let schema = test_schema();
-        // JSON has extra field "extra" not in schema - should be ignored
-        let line = r#"{"id": "abc123", "value": 42, "extra": "ignored"}"#;
-
-        let batch = parse_json_line(line, schema).unwrap();
-
-        assert_eq!(batch.num_rows(), 1);
-        assert_eq!(batch.num_columns(), 3);
-    }
-}
-
 mod checkpoint_tests {
-    use blizzard::checkpoint::{CheckpointState, PendingFile};
-    use blizzard::source::{FileReadState, SourceState};
-
-    #[test]
-    fn test_checkpoint_state_serialization() {
-        let mut source_state = SourceState::new();
-        source_state.update_file("file1.ndjson.gz", FileReadState::RecordsRead(100));
-        source_state.mark_finished("file2.ndjson.gz");
-
-        let state = CheckpointState::from_parts(
-            source_state,
-            vec![
-                PendingFile {
-                    filename: "pending1.parquet".to_string(),
-                    record_count: 500,
-                },
-                PendingFile {
-                    filename: "pending2.parquet".to_string(),
-                    record_count: 750,
-                },
-            ],
-            42,
-        );
-
-        // Serialize to JSON
-        let json = state.to_json().unwrap();
-
-        // Deserialize back
-        let restored = CheckpointState::from_json(&json).unwrap();
-
-        assert_eq!(restored.delta_version, 42);
-        assert_eq!(restored.pending_files.len(), 2);
-        assert_eq!(restored.pending_record_count(), 1250);
-        assert!(restored.source_state.is_file_finished("file2.ndjson.gz"));
-        assert_eq!(
-            restored.source_state.records_to_skip("file1.ndjson.gz"),
-            100
-        );
-    }
+    use blizzard::source::SourceState;
 
     #[test]
     fn test_source_state_tracking() {
@@ -367,9 +267,7 @@ mod parquet_tests {
         let batch = create_test_batch(100);
         writer.write_batch(&batch).unwrap();
 
-        assert_eq!(writer.current_record_count(), 100);
         assert!(writer.current_file_size() > 0);
-        assert!(writer.has_unflushed_data());
     }
 
     #[test]
@@ -383,7 +281,7 @@ mod parquet_tests {
             writer.write_batch(&batch).unwrap();
         }
 
-        assert_eq!(writer.current_record_count(), 500);
+        assert!(writer.current_file_size() > 0);
     }
 
     #[test]
@@ -397,7 +295,6 @@ mod parquet_tests {
 }
 
 mod sink_tests {
-    use super::*;
     use blizzard::sink::FinishedFile;
 
     #[test]

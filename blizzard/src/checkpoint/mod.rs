@@ -115,13 +115,6 @@ impl CheckpointManager {
         Ok(Some(checkpoint))
     }
 
-    /// Load a specific checkpoint by path.
-    pub async fn load_checkpoint(&self, path: &str) -> Result<CheckpointState> {
-        let checkpoint_bytes = self.storage.get(path).await?;
-        let checkpoint: CheckpointState = serde_json::from_slice(&checkpoint_bytes)?;
-        Ok(checkpoint)
-    }
-
     /// Get the current checkpoint ID.
     pub fn checkpoint_id(&self) -> u64 {
         self.checkpoint_id
@@ -182,12 +175,6 @@ impl CheckpointCoordinator {
         }
     }
 
-    /// Add a pending file to the checkpoint state.
-    pub async fn add_pending_file(&self, file: PendingFile) {
-        let mut files = self.pending_files.lock().await;
-        files.push(file);
-    }
-
     /// Clear pending files (after successful commit).
     pub async fn clear_pending_files(&self) {
         let mut files = self.pending_files.lock().await;
@@ -229,12 +216,11 @@ impl CheckpointCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::FileReadState;
 
     #[test]
     fn test_checkpoint_state_serialization() {
         let mut source_state = SourceState::new();
-        source_state.update_file("file1.ndjson.gz", FileReadState::RecordsRead(100));
+        source_state.update_records("file1.ndjson.gz", 100);
         source_state.mark_finished("file2.ndjson.gz");
 
         let state = CheckpointState {

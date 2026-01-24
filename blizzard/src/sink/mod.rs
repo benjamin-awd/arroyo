@@ -6,10 +6,6 @@ pub mod delta;
 pub mod multipart;
 pub mod parquet;
 
-pub use delta::DeltaSink;
-pub use multipart::{MultipartCheckpoint, MultipartManager, MultipartManagerBuilder};
-pub use parquet::{ParquetWriter, RollingPolicy, WriterStats};
-
 /// Information about a completed Parquet file.
 #[derive(Debug, Clone)]
 pub struct FinishedFile {

@@ -3,19 +3,14 @@
 //! Benchmarks for key operations:
 //! - JSON parsing throughput
 //! - Parquet writing throughput
-//! - Checkpoint serialization/deserialization
+//! - Parallel decompression
 
-use criterion::async_executor::AsyncExecutor;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use std::sync::Arc;
 
 mod bench_utils;
 
 use arrow_json::reader::ReaderBuilder;
-use blizzard::checkpoint::CheckpointState;
-use blizzard::config::ParquetCompression;
-use blizzard::sink::parquet::{ParquetFileBuilder, ParquetWriter, ParquetWriterConfig};
-use blizzard::source::reader::parse_json_line;
+use blizzard::sink::parquet::{ParquetWriter, ParquetWriterConfig};
 
 /// Benchmarks for JSON line parsing.
 ///
@@ -29,20 +24,7 @@ fn json_parsing_benchmarks(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(size as u64));
 
-        // Old approach: parse each line separately (creates decoder per line)
-        group.bench_with_input(
-            BenchmarkId::new("parse_single", size),
-            &lines,
-            |b, lines| {
-                b.iter(|| {
-                    for line in lines {
-                        parse_json_line(line, schema.clone()).unwrap();
-                    }
-                });
-            },
-        );
-
-        // Better approach: reuse decoder, decode line by line
+        // Reuse decoder, decode line by line
         group.bench_with_input(
             BenchmarkId::new("decode_reuse", size),
             &lines,
@@ -60,7 +42,7 @@ fn json_parsing_benchmarks(c: &mut Criterion) {
             },
         );
 
-        // Best approach: bulk decode with newline-separated bytes
+        // Bulk decode with newline-separated bytes
         let bulk_data: String = lines.join("\n");
         group.bench_with_input(
             BenchmarkId::new("decode_bulk", size),
@@ -111,144 +93,11 @@ fn parquet_writing_benchmarks(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmarks comparing different Parquet compression codecs.
-///
-/// Tests Snappy, Zstd, Gzip, and uncompressed performance.
-fn compression_benchmarks(c: &mut Criterion) {
-    let mut group = c.benchmark_group("compression");
-
-    // Use a moderate batch size with enough batches for meaningful compression comparison
-    let batches = bench_utils::generate_record_batches(8192, 20);
-    let total_records = 8192 * 20;
-
-    group.throughput(Throughput::Elements(total_records as u64));
-
-    let compressions = [
-        ("snappy", ParquetCompression::Snappy),
-        ("zstd", ParquetCompression::Zstd),
-        ("gzip", ParquetCompression::Gzip),
-        ("none", ParquetCompression::Uncompressed),
-    ];
-
-    for (name, compression) in compressions {
-        group.bench_with_input(BenchmarkId::from_parameter(name), &batches, |b, batches| {
-            b.iter(|| {
-                let schema = bench_utils::benchmark_schema();
-                ParquetFileBuilder::new(schema)
-                    .with_compression(compression)
-                    .build(batches)
-                    .unwrap()
-            });
-        });
-    }
-
-    group.finish();
-}
-
-/// Benchmarks for checkpoint serialization.
-///
-/// Tests the performance of serializing checkpoint state to JSON.
-fn checkpoint_serialization_benchmarks(c: &mut Criterion) {
-    let mut group = c.benchmark_group("checkpoint");
-
-    // Test with different checkpoint sizes
-    for (files, records_per_file) in [(10, 10000), (100, 50000), (1000, 100000)] {
-        let state = bench_utils::generate_checkpoint_state(files, records_per_file);
-
-        // Serialization benchmark
-        group.bench_with_input(BenchmarkId::new("serialize", files), &state, |b, state| {
-            b.iter(|| state.to_json().unwrap());
-        });
-
-        // Deserialization benchmark - serialize once, then benchmark deserialize
-        let json = state.to_json().unwrap();
-        group.bench_with_input(BenchmarkId::new("deserialize", files), &json, |b, json| {
-            b.iter(|| CheckpointState::from_json(json).unwrap());
-        });
-    }
-
-    group.finish();
-}
-
-/// Benchmarks for end-to-end file reading with BatchReader.
-///
-/// Tests actual throughput including gzip decompression and file I/O.
-fn reader_throughput_benchmarks(c: &mut Criterion) {
-    use blizzard::config::CompressionFormat;
-    use blizzard::source::reader::create_batch_reader;
-    use blizzard::storage::StorageProvider;
-    use std::path::Path;
-    use tokio::runtime::Runtime;
-
-    let rt = Runtime::new().unwrap();
-
-    let mut group = c.benchmark_group("reader_throughput");
-
-    for record_count in [10_000, 100_000, 500_000] {
-        // Generate test file
-        let temp_file = bench_utils::generate_ndjson_gz_file(record_count);
-        let file_path = temp_file.path().to_path_buf();
-        let parent_dir = file_path.parent().unwrap().to_str().unwrap().to_string();
-        let file_name = file_path.file_name().unwrap().to_str().unwrap().to_string();
-        let schema = bench_utils::benchmark_schema();
-
-        group.throughput(Throughput::Elements(record_count as u64));
-        group.bench_with_input(
-            BenchmarkId::new("batch_reader", record_count),
-            &(parent_dir.clone(), file_name.clone()),
-            |b, (dir, name)| {
-                b.to_async(&rt).iter(|| {
-                    let dir = dir.clone();
-                    let name = name.clone();
-                    let schema = schema.clone();
-                    async move {
-                        let storage = Arc::new(
-                            StorageProvider::for_url(&dir)
-                                .await
-                                .expect("Failed to create storage"),
-                        );
-
-                        let mut reader = create_batch_reader(
-                            &storage,
-                            &name,
-                            CompressionFormat::Gzip,
-                            schema,
-                            8192,
-                            0,
-                        )
-                        .await
-                        .expect("Failed to create reader");
-
-                        let mut total_records = 0;
-                        let mut batch_count = 0;
-                        while let Some(batch) =
-                            reader.next_batch().await.expect("Failed to read batch")
-                        {
-                            total_records += batch.batch.num_rows();
-                            batch_count += 1;
-                        }
-                        if total_records != record_count {
-                            eprintln!(
-                                "WARNING: Expected {} records, got {} in {} batches",
-                                record_count, total_records, batch_count
-                            );
-                        }
-                        total_records
-                    }
-                });
-            },
-        );
-    }
-
-    group.finish();
-}
-
 /// Benchmarks comparing sequential vs parallel gzip decompression.
 ///
 /// This benchmark verifies that parallel decompression utilizes multiple CPU cores
 /// by comparing the throughput of processing multiple files sequentially vs in parallel.
 fn parallel_decompression_benchmarks(c: &mut Criterion) {
-    use blizzard::config::CompressionFormat;
     use bytes::Bytes;
     use flate2::read::GzDecoder;
     use std::io::Read;
@@ -406,9 +255,6 @@ criterion_group!(
     benches,
     json_parsing_benchmarks,
     parquet_writing_benchmarks,
-    compression_benchmarks,
-    checkpoint_serialization_benchmarks,
-    reader_throughput_benchmarks,
     parallel_decompression_benchmarks,
 );
 criterion_main!(benches);
