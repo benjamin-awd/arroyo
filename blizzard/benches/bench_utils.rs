@@ -1,0 +1,167 @@
+//! Benchmark utilities for generating test data.
+
+use arrow::array::{BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use rand::Rng;
+use std::sync::Arc;
+
+use blizzard::checkpoint::{CheckpointState, PendingFile};
+use blizzard::source::state::{FileReadState, SourceState};
+
+/// Returns a realistic schema with mixed types for benchmarking.
+///
+/// Matches a typical orderbook-style schema:
+/// - id: String (non-nullable)
+/// - timestamp: Int64 (non-nullable)
+/// - price: Float64 (nullable)
+/// - quantity: Float64 (nullable)
+/// - side: String (nullable)
+/// - active: Boolean (nullable)
+pub fn benchmark_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("timestamp", DataType::Int64, false),
+        Field::new("price", DataType::Float64, true),
+        Field::new("quantity", DataType::Float64, true),
+        Field::new("side", DataType::Utf8, true),
+        Field::new("active", DataType::Boolean, true),
+    ]))
+}
+
+/// Generate NDJSON lines for parsing benchmarks.
+///
+/// Each line is a valid JSON object matching the benchmark schema.
+pub fn generate_json_lines(count: usize) -> Vec<String> {
+    let mut rng = rand::thread_rng();
+    let sides = ["buy", "sell"];
+
+    (0..count)
+        .map(|i| {
+            let side = sides[rng.gen_range(0..2)];
+            let price: f64 = rng.gen_range(100.0..10000.0);
+            let quantity: f64 = rng.gen_range(0.01..100.0);
+            let timestamp: i64 = 1700000000000 + (i as i64);
+            let active: bool = rng.gen_bool(0.9);
+
+            format!(
+                r#"{{"id":"order_{}","timestamp":{},"price":{:.2},"quantity":{:.4},"side":"{}","active":{}}}"#,
+                i, timestamp, price, quantity, side, active
+            )
+        })
+        .collect()
+}
+
+/// Generate Arrow RecordBatches for Parquet benchmarks.
+///
+/// Creates batches with the benchmark schema containing realistic data.
+pub fn generate_record_batches(batch_size: usize, num_batches: usize) -> Vec<RecordBatch> {
+    let schema = benchmark_schema();
+    let mut rng = rand::thread_rng();
+
+    (0..num_batches)
+        .map(|batch_idx| {
+            let base_idx = batch_idx * batch_size;
+
+            // Generate ids
+            let ids: Vec<String> = (0..batch_size)
+                .map(|i| format!("order_{}", base_idx + i))
+                .collect();
+
+            // Generate timestamps
+            let timestamps: Vec<i64> = (0..batch_size)
+                .map(|i| 1700000000000 + ((base_idx + i) as i64))
+                .collect();
+
+            // Generate prices (some nulls)
+            let prices: Vec<Option<f64>> = (0..batch_size)
+                .map(|_| {
+                    if rng.gen_bool(0.95) {
+                        Some(rng.gen_range(100.0..10000.0))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Generate quantities (some nulls)
+            let quantities: Vec<Option<f64>> = (0..batch_size)
+                .map(|_| {
+                    if rng.gen_bool(0.95) {
+                        Some(rng.gen_range(0.01..100.0))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Generate sides
+            let sides: Vec<Option<&str>> = (0..batch_size)
+                .map(|_| {
+                    if rng.gen_bool(0.5) {
+                        Some("buy")
+                    } else {
+                        Some("sell")
+                    }
+                })
+                .collect();
+
+            // Generate active flags
+            let active: Vec<Option<bool>> = (0..batch_size)
+                .map(|_| {
+                    if rng.gen_bool(0.98) {
+                        Some(rng.gen_bool(0.9))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(ids)),
+                    Arc::new(Int64Array::from(timestamps)),
+                    Arc::new(Float64Array::from(prices)),
+                    Arc::new(Float64Array::from(quantities)),
+                    Arc::new(StringArray::from(sides)),
+                    Arc::new(BooleanArray::from(active)),
+                ],
+            )
+            .expect("Failed to create RecordBatch")
+        })
+        .collect()
+}
+
+/// Generate checkpoint state for serialization benchmarks.
+///
+/// Creates a realistic checkpoint state with:
+/// - `files` number of tracked source files
+/// - `records_per_file` average records read per in-progress file
+pub fn generate_checkpoint_state(files: usize, records_per_file: usize) -> CheckpointState {
+    let mut rng = rand::thread_rng();
+    let mut source_state = SourceState::new();
+
+    // Create source file states - mix of finished and in-progress
+    for i in 0..files {
+        let path = format!("s3://bucket/input/file_{:05}.ndjson.gz", i);
+        if rng.gen_bool(0.3) {
+            // 30% finished
+            source_state.update_file(&path, FileReadState::Finished);
+        } else {
+            // 70% in progress with varying record counts
+            let records = rng.gen_range(records_per_file / 2..records_per_file * 2);
+            source_state.update_file(&path, FileReadState::RecordsRead(records));
+        }
+    }
+
+    // Create pending files (files written but not yet committed to Delta)
+    let num_pending = rng.gen_range(1..=5);
+    let pending_files: Vec<PendingFile> = (0..num_pending)
+        .map(|i| PendingFile {
+            filename: format!("01934567-89ab-cdef-0123-{:012x}.parquet", i),
+            record_count: rng.gen_range(50000..150000),
+        })
+        .collect();
+
+    CheckpointState::from_parts(source_state, pending_files, rng.gen_range(0..1000))
+}
