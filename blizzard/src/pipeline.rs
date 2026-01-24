@@ -19,7 +19,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::checkpoint::CheckpointCoordinator;
@@ -27,7 +28,6 @@ use crate::config::{CompressionFormat, Config};
 use crate::sink::FinishedFile;
 use crate::sink::delta::DeltaSink;
 use crate::sink::parquet::{ParquetWriter, ParquetWriterConfig, RollingPolicy};
-use crate::source::reader::NdjsonReader;
 use crate::storage::{StorageProvider, StorageProviderRef, list_ndjson_files};
 
 /// Statistics about the pipeline run.
@@ -81,12 +81,12 @@ pub struct Pipeline {
     sink_storage: StorageProviderRef,
     checkpoint_coordinator: CheckpointCoordinator,
     stats: PipelineStats,
-    shutdown_rx: watch::Receiver<bool>,
+    shutdown: CancellationToken,
 }
 
 impl Pipeline {
     /// Create a new pipeline from configuration.
-    pub async fn new(config: Config, shutdown_rx: watch::Receiver<bool>) -> Result<Self> {
+    pub async fn new(config: Config, shutdown: CancellationToken) -> Result<Self> {
         // Create storage providers
         let source_storage = Arc::new(
             StorageProvider::for_url_with_options(
@@ -121,7 +121,7 @@ impl Pipeline {
             sink_storage,
             checkpoint_coordinator,
             stats: PipelineStats::default(),
-            shutdown_rx,
+            shutdown,
         })
     }
 
@@ -133,87 +133,36 @@ impl Pipeline {
     pub async fn run(&mut self) -> Result<PipelineStats> {
         info!("Starting pipeline");
 
-        // Try to restore from checkpoint
-        let checkpoint = self.checkpoint_coordinator.restore().await?;
-        if let Some(ref cp) = checkpoint {
-            info!(
-                "Restored from checkpoint, delta version: {}, pending files: {}",
-                cp.delta_version,
-                cp.pending_files.len()
-            );
-        }
+        // Race initialization against shutdown signal
+        let shutdown = self.shutdown.clone();
+        let state = tokio::select! {
+            biased;
 
-        // Create the Arrow schema from config
-        let schema = self.config.to_arrow_schema();
-
-        // Create Delta sink
-        let mut delta_sink = DeltaSink::new(self.sink_storage.clone(), &schema).await?;
-
-        // Handle pending files from checkpoint
-        if let Some(ref cp) = checkpoint {
-            if !cp.pending_files.is_empty() {
-                info!(
-                    "Committing {} pending files from checkpoint",
-                    cp.pending_files.len()
-                );
-                let finished_files: Vec<FinishedFile> = cp
-                    .pending_files
-                    .iter()
-                    .map(|pf| FinishedFile {
-                        filename: pf.filename.clone(),
-                        size: 0, // Size is not critical for commit
-                        record_count: pf.record_count,
-                        bytes: None, // Files already uploaded, just need to commit
-                    })
-                    .collect();
-
-                if let Some(version) = delta_sink.commit_files(&finished_files).await? {
-                    self.checkpoint_coordinator
-                        .update_delta_version(version)
-                        .await;
-                    self.stats.delta_commits += 1;
-                }
-                self.checkpoint_coordinator.clear_pending_files().await;
+            _ = shutdown.cancelled() => {
+                info!("Shutdown requested during initialization");
+                return Ok(self.stats.clone());
             }
-        }
 
-        // List source files
-        let source_files = self.list_source_files().await?;
-        info!("Found {} source files", source_files.len());
+            result = self.prepare_pipeline() => result?,
+        };
 
-        // Get current source state
-        let source_state = self.checkpoint_coordinator.get_source_state().await;
-
-        // Filter to unprocessed files
-        let pending_files: Vec<String> = source_state
-            .pending_files(&source_files)
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect();
-        info!("{} files remaining to process", pending_files.len());
-
-        if pending_files.is_empty() {
+        // Handle empty work case
+        let Some(state) = state else {
             info!("No files to process");
             return Ok(self.stats.clone());
-        }
+        };
 
-        // Create reader config
-        let reader = NdjsonReader::new(schema.clone(), self.config.source.batch_size);
-
-        // Build rolling policies from config
-        let rolling_policies = self.build_rolling_policies();
-
-        let writer_config = ParquetWriterConfig::default()
-            .with_file_size_mb(self.config.sink.file_size_mb)
-            .with_row_group_size_bytes(self.config.sink.row_group_size_bytes)
-            .with_compression(self.config.sink.compression)
-            .with_rolling_policies(rolling_policies);
-
-        let mut writer = ParquetWriter::new(schema.clone(), writer_config);
-
-        let max_concurrent = self.config.source.max_concurrent_files;
-        let compression = self.config.source.compression;
-        let batch_size = reader.batch_size();
+        // Unpack initialized state
+        let InitializedState {
+            pending_files,
+            source_state,
+            schema,
+            mut writer,
+            delta_sink,
+            max_concurrent,
+            compression,
+            batch_size,
+        } = state;
 
         info!(
             "Processing files with max_concurrent_files={} (download-then-decompress mode)",
@@ -387,7 +336,7 @@ impl Pipeline {
         let storage = self.source_storage.clone();
         let source_state_clone = source_state.clone();
         let pending_files_clone = pending_files.clone();
-        let shutdown_rx = self.shutdown_rx.clone();
+        let shutdown = self.shutdown.clone();
 
         let download_handle = tokio::spawn(async move {
             let mut downloads: FuturesUnordered<
@@ -411,7 +360,7 @@ impl Pipeline {
 
             // Process downloads and start new ones as they complete
             while let Some(result) = downloads.next().await {
-                if *shutdown_rx.borrow() {
+                if shutdown.is_cancelled() {
                     debug!("[download] Shutdown requested, stopping downloads");
                     break;
                 }
@@ -498,7 +447,7 @@ impl Pipeline {
             };
 
         loop {
-            if *self.shutdown_rx.borrow() {
+            if self.shutdown.is_cancelled() {
                 info!("Shutdown requested, stopping processing");
                 self.checkpoint_coordinator.checkpoint().await?;
                 break;
@@ -639,6 +588,99 @@ impl Pipeline {
         info!("Final Delta table version: {}", delta_sink.version());
 
         Ok(self.stats.clone())
+    }
+
+    /// Prepare the pipeline for processing.
+    ///
+    /// Performs all initialization: checkpoint restoration, Delta sink creation,
+    /// file listing, and writer setup. Returns `None` if there are no files to process.
+    ///
+    /// This method is designed to be cancellation-safe - it can be dropped at any
+    /// `.await` point without leaving the system in an inconsistent state.
+    async fn prepare_pipeline(&mut self) -> Result<Option<InitializedState>> {
+        // Restore from checkpoint
+        let checkpoint = self.checkpoint_coordinator.restore().await?;
+        if let Some(ref cp) = checkpoint {
+            info!(
+                "Restored from checkpoint, delta version: {}, pending files: {}",
+                cp.delta_version,
+                cp.pending_files.len()
+            );
+        }
+
+        // Create the Arrow schema from config
+        let schema = self.config.to_arrow_schema();
+
+        // Create Delta sink
+        let mut delta_sink = DeltaSink::new(self.sink_storage.clone(), &schema).await?;
+
+        // Handle pending files from checkpoint
+        if let Some(ref cp) = checkpoint {
+            if !cp.pending_files.is_empty() {
+                info!(
+                    "Committing {} pending files from checkpoint",
+                    cp.pending_files.len()
+                );
+                let finished_files: Vec<FinishedFile> = cp
+                    .pending_files
+                    .iter()
+                    .map(|pf| FinishedFile {
+                        filename: pf.filename.clone(),
+                        size: 0, // Size is not critical for commit
+                        record_count: pf.record_count,
+                        bytes: None, // Files already uploaded, just need to commit
+                    })
+                    .collect();
+
+                if let Some(version) = delta_sink.commit_files(&finished_files).await? {
+                    self.checkpoint_coordinator
+                        .update_delta_version(version)
+                        .await;
+                    self.stats.delta_commits += 1;
+                }
+                self.checkpoint_coordinator.clear_pending_files().await;
+            }
+        }
+
+        // List source files
+        let source_files = self.list_source_files().await?;
+        info!("Found {} source files", source_files.len());
+
+        // Get current source state
+        let source_state = self.checkpoint_coordinator.get_source_state().await;
+
+        // Filter to unprocessed files
+        let pending_files: Vec<String> = source_state
+            .pending_files(&source_files)
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        info!("{} files remaining to process", pending_files.len());
+
+        if pending_files.is_empty() {
+            return Ok(None);
+        }
+
+        // Build writer configuration
+        let rolling_policies = self.build_rolling_policies();
+        let writer_config = ParquetWriterConfig::default()
+            .with_file_size_mb(self.config.sink.file_size_mb)
+            .with_row_group_size_bytes(self.config.sink.row_group_size_bytes)
+            .with_compression(self.config.sink.compression)
+            .with_rolling_policies(rolling_policies);
+
+        let writer = ParquetWriter::new(schema.clone(), writer_config);
+
+        Ok(Some(InitializedState {
+            pending_files,
+            source_state,
+            schema,
+            writer,
+            delta_sink,
+            max_concurrent: self.config.source.max_concurrent_files,
+            compression: self.config.source.compression,
+            batch_size: self.config.source.batch_size,
+        }))
     }
 
     /// Build rolling policies from configuration.
@@ -827,17 +869,19 @@ async fn upload_file(
 
 /// Run the pipeline with the given configuration.
 pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let shutdown = CancellationToken::new();
 
     // Set up signal handler for graceful shutdown
-    let shutdown_tx_clone = shutdown_tx.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        info!("Received shutdown signal");
-        shutdown_tx_clone.send(true).ok();
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            tokio::signal::ctrl_c().await.ok();
+            info!("Received shutdown signal");
+            shutdown.cancel();
+        }
     });
 
-    let mut pipeline = Pipeline::new(config, shutdown_rx).await?;
+    let mut pipeline = Pipeline::new(config, shutdown).await?;
     pipeline.run().await
 }
 
