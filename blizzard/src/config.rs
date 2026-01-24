@@ -37,10 +37,18 @@ pub struct SourceConfig {
     /// Batch size for reading records (default: 8192)
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+
+    /// Maximum number of files to process concurrently (default: 4)
+    #[serde(default = "default_max_concurrent_files")]
+    pub max_concurrent_files: usize,
 }
 
 fn default_batch_size() -> usize {
     8192
+}
+
+fn default_max_concurrent_files() -> usize {
+    4
 }
 
 /// Sink configuration for writing to Delta Lake.
@@ -267,6 +275,7 @@ mod tests {
                 compression: CompressionFormat::Gzip,
                 storage_options: HashMap::new(),
                 batch_size: 8192,
+                max_concurrent_files: 4,
             },
             sink: SinkConfig {
                 path: "s3://bucket/output/table".to_string(),

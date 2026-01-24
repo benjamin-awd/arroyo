@@ -7,7 +7,7 @@ pub mod multipart;
 pub mod parquet;
 
 pub use delta::DeltaSink;
-pub use multipart::{MultipartManager, MultipartManagerBuilder, MultipartCheckpoint};
+pub use multipart::{MultipartCheckpoint, MultipartManager, MultipartManagerBuilder};
 pub use parquet::{ParquetWriter, RollingPolicy, WriterStats};
 
 /// Information about a completed Parquet file.

@@ -6,6 +6,7 @@ sink:
   path: "gs://data-dev-596660-iceberg-test/delta/src_flowdesk_public__orderbooks_v1"
   file_size_mb: 128
   compression: snappy
+  max_concurrent_files: 100
 
 checkpoint:
   path: "gs://data-dev-596660-iceberg-test/delta/src_flowdesk_public__orderbooks_v1/_checkpoints"

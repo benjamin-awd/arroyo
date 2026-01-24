@@ -83,7 +83,10 @@ impl FileWriteState {
 
     /// Check if the write is complete and ready for commit.
     pub fn is_complete(&self) -> bool {
-        matches!(self, FileWriteState::SinglePut { .. } | FileWriteState::MultipartComplete { .. })
+        matches!(
+            self,
+            FileWriteState::SinglePut { .. } | FileWriteState::MultipartComplete { .. }
+        )
     }
 }
 
@@ -262,18 +265,14 @@ mod tests {
     fn test_file_write_state_serialization() {
         let state = FileWriteState::MultipartInFlight {
             filename: "test.parquet".to_string(),
-            completed_parts: vec![
-                CompletedPart {
-                    part_index: 0,
-                    content_id: "etag1".to_string(),
-                },
-            ],
-            in_flight_parts: vec![
-                InFlightPart {
-                    part_index: 1,
-                    data: vec![1, 2, 3, 4],
-                },
-            ],
+            completed_parts: vec![CompletedPart {
+                part_index: 0,
+                content_id: "etag1".to_string(),
+            }],
+            in_flight_parts: vec![InFlightPart {
+                part_index: 1,
+                data: vec![1, 2, 3, 4],
+            }],
             record_count: 1000,
         };
 
@@ -290,14 +289,12 @@ mod tests {
         let state = CheckpointState::from_parts_with_writes(
             SourceState::new(),
             vec![],
-            vec![
-                FileWriteState::MultipartInFlight {
-                    filename: "upload.parquet".to_string(),
-                    completed_parts: vec![],
-                    in_flight_parts: vec![],
-                    record_count: 500,
-                },
-            ],
+            vec![FileWriteState::MultipartInFlight {
+                filename: "upload.parquet".to_string(),
+                completed_parts: vec![],
+                in_flight_parts: vec![],
+                record_count: 500,
+            }],
             3,
         );
 

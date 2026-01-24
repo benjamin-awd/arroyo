@@ -11,7 +11,7 @@ use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
-use object_store::{ObjectStore, PutPayload, RetryConfig, MultipartUpload, WriteMultipart};
+use object_store::{MultipartUpload, ObjectStore, PutPayload, RetryConfig, WriteMultipart};
 use regex::Regex;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -508,6 +508,13 @@ impl StorageProvider {
         let path = self.qualify_path(path);
         self.object_store.put(&path, bytes).await?;
 
+        Ok(())
+    }
+
+    /// Put a payload to a path.
+    pub async fn put_payload(&self, path: &Path, payload: PutPayload) -> Result<()> {
+        let path = self.qualify_path(path);
+        self.object_store.put(&path, payload).await?;
         Ok(())
     }
 

@@ -4,6 +4,8 @@
 //! streaming pipeline with backpressure and graceful shutdown.
 
 use anyhow::Result;
+use arrow::array::RecordBatch;
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -14,7 +16,7 @@ use crate::config::Config;
 use crate::sink::FinishedFile;
 use crate::sink::delta::DeltaSink;
 use crate::sink::parquet::{ParquetWriter, ParquetWriterConfig, RollingPolicy};
-use crate::source::reader::{NdjsonReader, create_batch_reader};
+use crate::source::reader::{BatchReader, NdjsonReader, create_batch_reader};
 use crate::storage::{StorageProvider, StorageProviderRef, list_ndjson_files};
 
 /// Statistics about the pipeline run.
@@ -26,6 +28,23 @@ pub struct PipelineStats {
     pub parquet_files_written: usize,
     pub delta_commits: usize,
     pub checkpoints_saved: usize,
+}
+
+/// Progress from processing a file batch.
+struct FileProgress {
+    file_path: String,
+    batch: Option<RecordBatch>,
+    records_read: usize,
+    finished: bool,
+    reader: Option<BatchReader>,
+}
+
+/// Event type for the parallel file processing loop.
+enum FileEvent {
+    /// A batch was read from a file (or file finished).
+    BatchReady(Result<FileProgress>),
+    /// A new reader was created for a file.
+    ReaderCreated(Result<(String, BatchReader, usize)>),
 }
 
 /// Main processing pipeline.
@@ -151,71 +170,149 @@ impl Pipeline {
 
         let mut writer = ParquetWriter::new(schema, writer_config);
 
-        // Process each file
-        for file_path in pending_files {
+        // Process files concurrently using FuturesUnordered
+        let max_concurrent = self.config.source.max_concurrent_files;
+        let mut pending_iter = pending_files.into_iter();
+        let mut active: FuturesUnordered<
+            std::pin::Pin<Box<dyn std::future::Future<Output = FileEvent> + Send>>,
+        > = FuturesUnordered::new();
+        let mut active_file_count = 0usize;
+
+        info!(
+            "Processing files with max_concurrent_files={}",
+            max_concurrent
+        );
+
+        // Start initial file readers
+        for file_path in pending_iter.by_ref().take(max_concurrent) {
+            let skip = source_state.records_to_skip(file_path);
+            active_file_count += 1;
+            info!(
+                "[+] Starting file {} (active: {}): {}",
+                active_file_count, active_file_count, file_path
+            );
+            active.push(self.create_reader_future(
+                file_path.to_string(),
+                reader.schema().clone(),
+                reader.batch_size(),
+                skip,
+            ));
+        }
+
+        while let Some(event) = active.next().await {
             if *self.shutdown_rx.borrow() {
                 info!("Shutdown requested, stopping processing");
+                // Save checkpoint before exiting
+                self.checkpoint_coordinator.checkpoint().await?;
                 break;
             }
 
-            let records_to_skip = source_state.records_to_skip(file_path);
-
-            debug!(
-                "Processing file: {}, skipping {} records",
-                self.source_storage.canonical_url_for(file_path),
-                records_to_skip
-            );
-
-            let result = self
-                .process_file(
-                    &reader,
-                    &mut writer,
-                    &mut delta_sink,
-                    file_path,
-                    records_to_skip,
-                )
-                .await;
-
-            match result {
-                Ok(records) => {
-                    self.checkpoint_coordinator
-                        .update_source_state(file_path, records, true)
-                        .await;
-                    self.stats.files_processed += 1;
-                    self.stats.records_processed += records;
-                    debug!(
-                        "Finished file: {}, {} records (parquet: total={}, row_group={})",
-                        self.source_storage.canonical_url_for(file_path),
-                        records,
-                        writer.current_record_count(),
-                        writer.current_row_group_records()
-                    );
+            match event {
+                FileEvent::ReaderCreated(Ok((file_path, batch_reader, skip))) => {
+                    // Reader created, start reading batches
+                    active.push(Self::create_batch_future(file_path, batch_reader, skip));
                 }
-                Err(e) => {
+                FileEvent::ReaderCreated(Err(e)) => {
                     let error_str = e.to_string();
                     // Check if this is a 404/not found error (file was deleted)
                     if error_str.contains("not found")
                         || error_str.contains("404")
                         || error_str.contains("NoSuchKey")
                     {
-                        tracing::warn!(
-                            "Skipping missing file {}: {}",
-                            self.source_storage.canonical_url_for(file_path),
-                            e
-                        );
-                        // Mark as finished so we don't retry
-                        self.checkpoint_coordinator
-                            .update_source_state(file_path, 0, true)
-                            .await;
+                        tracing::warn!("Skipping missing file: {}", e);
+                        // Start next file if available
+                        if let Some(next_file) = pending_iter.next() {
+                            let skip = source_state.records_to_skip(next_file);
+                            active.push(self.create_reader_future(
+                                next_file.to_string(),
+                                reader.schema().clone(),
+                                reader.batch_size(),
+                                skip,
+                            ));
+                        }
                         continue;
                     }
+                    error!("Error creating reader: {}", e);
+                    self.checkpoint_coordinator.checkpoint().await?;
+                    return Err(e);
+                }
+                FileEvent::BatchReady(Ok(progress)) => {
+                    // Extract just the filename for cleaner logs
+                    let short_name = progress
+                        .file_path
+                        .split('/')
+                        .last()
+                        .unwrap_or(&progress.file_path);
 
-                    error!(
-                        "Error processing file {}: {}",
-                        self.source_storage.canonical_url_for(file_path),
-                        e
-                    );
-                    // Save checkpoint on error
+                    if let Some(ref batch) = progress.batch {
+                        debug!(
+                            "[batch] {}: {} rows (total: {})",
+                            short_name,
+                            batch.num_rows(),
+                            progress.records_read
+                        );
+                        writer.write_batch(batch)?;
+                        self.stats.records_processed += batch.num_rows();
+                    }
+
+                    self.checkpoint_coordinator
+                        .update_source_state(
+                            &progress.file_path,
+                            progress.records_read,
+                            progress.finished,
+                        )
+                        .await;
+
+                    if progress.finished {
+                        active_file_count -= 1;
+                        self.stats.files_processed += 1;
+                        info!(
+                            "[-] Finished file (active: {}): {} ({} records)",
+                            active_file_count, short_name, progress.records_read
+                        );
+
+                        // Start next file if available
+                        if let Some(next_file) = pending_iter.next() {
+                            let skip = source_state.records_to_skip(next_file);
+                            active_file_count += 1;
+                            let next_short = next_file.split('/').last().unwrap_or(next_file);
+                            info!(
+                                "[+] Starting file (active: {}): {}",
+                                active_file_count, next_short
+                            );
+                            active.push(self.create_reader_future(
+                                next_file.to_string(),
+                                reader.schema().clone(),
+                                reader.batch_size(),
+                                skip,
+                            ));
+                        }
+                    } else if let Some(batch_reader) = progress.reader {
+                        // Continue reading this file
+                        active.push(Self::create_batch_future(
+                            progress.file_path,
+                            batch_reader,
+                            progress.records_read,
+                        ));
+                    }
+
+                    // Flush finished parquet files
+                    let finished = writer.take_finished_files();
+                    if !finished.is_empty() {
+                        self.flush_finished_files(&finished, &mut delta_sink)
+                            .await?;
+                    }
+                }
+                FileEvent::BatchReady(Err(e)) => {
+                    let error_str = e.to_string();
+                    if error_str.contains("not found")
+                        || error_str.contains("404")
+                        || error_str.contains("NoSuchKey")
+                    {
+                        tracing::warn!("Skipping file with read error: {}", e);
+                        continue;
+                    }
+                    error!("Error reading batch: {}", e);
                     self.checkpoint_coordinator.checkpoint().await?;
                     return Err(e);
                 }
@@ -265,54 +362,53 @@ impl Pipeline {
         list_ndjson_files(&self.source_storage).await
     }
 
-    /// Process a single file.
-    async fn process_file(
-        &mut self,
-        reader: &NdjsonReader,
-        writer: &mut ParquetWriter,
-        delta_sink: &mut DeltaSink,
-        file_path: &str,
-        skip_records: usize,
-    ) -> Result<usize> {
-        let mut batch_reader = create_batch_reader(
-            &self.source_storage,
-            file_path,
-            self.config.source.compression,
-            reader.schema().clone(),
-            reader.batch_size(),
-            skip_records,
-        )
-        .await?;
+    /// Create a future that initializes a batch reader for a file.
+    fn create_reader_future(
+        &self,
+        file_path: String,
+        schema: Arc<arrow::datatypes::Schema>,
+        batch_size: usize,
+        skip: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = FileEvent> + Send>> {
+        let storage = self.source_storage.clone();
+        let compression = self.config.source.compression;
 
-        let mut total_records = skip_records;
-
-        while let Some(tracked_batch) = batch_reader.next_batch().await? {
-            // Check for shutdown
-            if *self.shutdown_rx.borrow() {
-                // Save progress before shutting down
-                self.checkpoint_coordinator
-                    .update_source_state(file_path, total_records, false)
+        Box::pin(async move {
+            let result =
+                create_batch_reader(&storage, &file_path, compression, schema, batch_size, skip)
                     .await;
-                self.checkpoint_coordinator.checkpoint().await?;
-                return Ok(total_records);
+            match result {
+                Ok(reader) => FileEvent::ReaderCreated(Ok((file_path, reader, skip))),
+                Err(e) => FileEvent::ReaderCreated(Err(e)),
             }
+        })
+    }
 
-            tracing::debug!(
-                "Writing batch: {} rows, total_so_far={}",
-                tracked_batch.batch.num_rows(),
-                tracked_batch.records_read
-            );
-            writer.write_batch(&tracked_batch.batch)?;
-            total_records = tracked_batch.records_read;
-
-            // Flush finished files to Delta
-            let finished = writer.take_finished_files();
-            if !finished.is_empty() {
-                self.flush_finished_files(&finished, delta_sink).await?;
+    /// Create a future that reads the next batch from a file.
+    fn create_batch_future(
+        file_path: String,
+        mut batch_reader: BatchReader,
+        current_records: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = FileEvent> + Send>> {
+        Box::pin(async move {
+            match batch_reader.next_batch().await {
+                Ok(Some(tracked)) => FileEvent::BatchReady(Ok(FileProgress {
+                    file_path,
+                    batch: Some(tracked.batch),
+                    records_read: tracked.records_read,
+                    finished: false,
+                    reader: Some(batch_reader),
+                })),
+                Ok(None) => FileEvent::BatchReady(Ok(FileProgress {
+                    file_path,
+                    batch: None,
+                    records_read: current_records,
+                    finished: true,
+                    reader: None,
+                })),
+                Err(e) => FileEvent::BatchReady(Err(e)),
             }
-        }
-
-        Ok(total_records)
+        })
     }
 
     /// Flush finished Parquet files to Delta Lake.

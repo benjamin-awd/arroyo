@@ -6,7 +6,7 @@
 use anyhow::Result;
 use bytes::Bytes;
 use object_store::path::Path;
-use object_store::{MultipartUpload, PutPayloadMut, PutResult};
+use object_store::{MultipartUpload, PutPayload, PutPayloadMut, PutResult};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -16,7 +16,7 @@ use crate::storage::StorageProviderRef;
 #[derive(Debug, Clone)]
 pub enum PartState {
     /// Part is queued for upload.
-    Pending { data: Bytes },
+    Pending { data: PutPayload },
     /// Part has been successfully uploaded.
     Completed,
 }
@@ -25,7 +25,7 @@ pub enum PartState {
 #[derive(Debug, Clone)]
 pub struct PartToUpload {
     pub part_index: usize,
-    pub data: Bytes,
+    pub data: PutPayload,
 }
 
 /// Checkpoint data for a multipart upload.
@@ -139,17 +139,9 @@ impl MultipartManager {
         }
 
         let data = std::mem::replace(&mut self.current_buffer, PutPayloadMut::new());
-        let bytes = data.freeze();
+        let payload = data.freeze(); // PutPayload - zero copy!
 
-        // Collect all bytes from the PutPayload into a single Bytes
-        let mut collected = Vec::new();
-        for chunk in bytes {
-            collected.extend_from_slice(&chunk);
-        }
-
-        self.parts.push(PartState::Pending {
-            data: Bytes::from(collected),
-        });
+        self.parts.push(PartState::Pending { data: payload });
     }
 
     /// Get parts that are ready to be uploaded.
@@ -199,9 +191,7 @@ impl MultipartManager {
         if !self.closed {
             return false;
         }
-        self.parts
-            .iter()
-            .all(|p| matches!(p, PartState::Completed))
+        self.parts.iter().all(|p| matches!(p, PartState::Completed))
     }
 
     /// Get the number of completed parts.
@@ -238,8 +228,8 @@ impl MultipartManager {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Multipart upload not initialized"))?;
 
-        // put_part returns an UploadPart future that we await
-        upload.put_part(data.into()).await?;
+        // put_part accepts PutPayload directly - no conversion needed
+        upload.put_part(data).await?;
 
         // Mark the part as completed
         self.parts[part_index] = PartState::Completed;
@@ -312,9 +302,12 @@ impl MultipartManager {
             .enumerate()
             .filter_map(|(idx, state)| {
                 if let PartState::Pending { data } = state {
+                    // Collect chunks only for checkpoint serialization
+                    let bytes: Vec<u8> =
+                        data.clone().into_iter().flat_map(|b| b.to_vec()).collect();
                     Some(PendingPartCheckpoint {
                         part_index: idx,
-                        data: data.to_vec(),
+                        data: bytes,
                     })
                 } else {
                     None
@@ -346,17 +339,22 @@ impl MultipartManager {
         // Flush any buffered data
         self.flush_buffer_to_part();
 
-        // Collect all data
-        let mut all_data = Vec::new();
-        for part in &self.parts {
-            if let PartState::Pending { data } = part {
-                all_data.extend_from_slice(data);
-            }
-        }
+        // Collect all PutPayload chunks into single payload
+        let all_chunks: Vec<Bytes> = self
+            .parts
+            .iter()
+            .filter_map(|part| {
+                if let PartState::Pending { data } = part {
+                    Some(data.clone().into_iter())
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect();
 
-        // Upload as single PUT
-        let bytes = Bytes::from(all_data);
-        self.storage.put_bytes(&self.location, bytes).await?;
+        let payload: PutPayload = all_chunks.into_iter().collect();
+        self.storage.put_payload(&self.location, payload).await?;
         info!(
             "Completed single PUT upload for {}, {} bytes",
             self.location, self.pushed_size

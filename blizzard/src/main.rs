@@ -57,6 +57,10 @@ struct Args {
     #[arg(long, default_value = "8192")]
     batch_size: usize,
 
+    /// Maximum number of files to process concurrently.
+    #[arg(long, default_value = "4")]
+    max_concurrent_files: usize,
+
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -163,6 +167,7 @@ fn build_config(args: &Args) -> Result<Config> {
             compression: config::CompressionFormat::Gzip,
             storage_options: std::collections::HashMap::new(),
             batch_size: args.batch_size,
+            max_concurrent_files: args.max_concurrent_files,
         },
         sink: config::SinkConfig {
             path: sink,

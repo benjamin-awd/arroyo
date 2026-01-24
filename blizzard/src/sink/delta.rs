@@ -284,7 +284,8 @@ pub async fn commit_files_to_delta(
     }
 
     // Check for duplicate files using version range check (matches Arroyo's approach)
-    if let Some(existing_version) = check_existing_files(table, last_version, finished_files).await?
+    if let Some(existing_version) =
+        check_existing_files(table, last_version, finished_files).await?
     {
         debug!(
             "Files already committed at version {}, skipping",
