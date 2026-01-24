@@ -18,7 +18,7 @@ use uuid::Uuid;
 use super::FinishedFile;
 use crate::config::ParquetCompression;
 
-/// Statistics for tracking writer state (matches Arroyo's MultiPartWriterStats).
+/// Statistics for tracking writer state.
 #[derive(Debug, Clone, Copy)]
 pub struct WriterStats {
     /// Total bytes written to the buffer (compressed).
@@ -43,7 +43,7 @@ impl WriterStats {
     }
 }
 
-/// Policy for when to roll files (matches Arroyo's RollingPolicy).
+/// Policy for when to roll files.
 #[derive(Debug, Clone)]
 pub enum RollingPolicy {
     /// Roll when file reaches this size in bytes.
@@ -240,7 +240,7 @@ impl ParquetWriter {
         self.stats.last_write_at = Instant::now();
         self.row_group_records += batch.num_rows();
 
-        // Flush row group based on byte size (matches Arroyo's approach using in_progress_size)
+        // Flush row group based on byte size
         let in_progress_size = writer.in_progress_size();
         if in_progress_size > self.config.row_group_size_bytes {
             tracing::info!(
@@ -254,7 +254,7 @@ impl ParquetWriter {
             );
             writer.flush()?;
             self.row_group_records = 0;
-            // Update bytes_written after flush (like Arroyo)
+            // Update bytes_written after flush
             self.stats.bytes_written = self.buffer.len();
             tracing::info!(
                 "After flush: buffer={} bytes ({:.2} MB), bytes_written={}",

@@ -242,7 +242,7 @@ pub async fn commit_files_to_delta(
         return Ok(None);
     }
 
-    // Check for duplicate files using version range check (matches Arroyo's approach)
+    // Check for duplicate files using version range check
     if let Some(existing_version) =
         check_existing_files(table, last_version, finished_files).await?
     {

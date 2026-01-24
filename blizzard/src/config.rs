@@ -84,6 +84,14 @@ pub struct SinkConfig {
     #[serde(default = "default_min_multipart_size_mb")]
     pub min_multipart_size_mb: usize,
 
+    /// Maximum concurrent file uploads (default: 4)
+    #[serde(default = "default_max_concurrent_uploads")]
+    pub max_concurrent_uploads: usize,
+
+    /// Maximum concurrent parts per multipart upload (default: 8)
+    #[serde(default = "default_max_concurrent_parts")]
+    pub max_concurrent_parts: usize,
+
     /// Storage options (credentials, region, etc.)
     #[serde(default)]
     pub storage_options: HashMap<String, String>,
@@ -107,6 +115,14 @@ fn default_part_size_mb() -> usize {
 
 fn default_min_multipart_size_mb() -> usize {
     5
+}
+
+fn default_max_concurrent_uploads() -> usize {
+    4
+}
+
+fn default_max_concurrent_parts() -> usize {
+    8
 }
 
 /// Checkpoint configuration for recovery.
@@ -285,6 +301,8 @@ mod tests {
                 rollover_timeout_secs: None,
                 part_size_mb: 32,
                 min_multipart_size_mb: 5,
+                max_concurrent_uploads: 4,
+                max_concurrent_parts: 8,
                 storage_options: HashMap::new(),
                 compression: ParquetCompression::Snappy,
             },

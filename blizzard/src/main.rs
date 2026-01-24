@@ -177,6 +177,8 @@ fn build_config(args: &Args) -> Result<Config> {
             rollover_timeout_secs: None,
             part_size_mb: 32,
             min_multipart_size_mb: 5,
+            max_concurrent_uploads: 4,
+            max_concurrent_parts: 8,
             storage_options: std::collections::HashMap::new(),
             compression: config::ParquetCompression::Snappy,
         },

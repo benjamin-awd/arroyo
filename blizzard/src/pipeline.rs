@@ -15,6 +15,8 @@ use anyhow::Result;
 use arrow::array::RecordBatch;
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -51,6 +53,25 @@ struct ProcessedFile {
     path: String,
     batches: Vec<RecordBatch>,
     total_records: usize,
+}
+
+/// Result of uploading a file.
+struct UploadResult {
+    filename: String,
+    size: usize,
+    record_count: usize,
+}
+
+/// Initialized pipeline state ready for processing.
+struct InitializedState {
+    pending_files: Vec<String>,
+    source_state: crate::source::SourceState,
+    schema: Arc<arrow::datatypes::Schema>,
+    writer: ParquetWriter,
+    delta_sink: DeltaSink,
+    max_concurrent: usize,
+    compression: CompressionFormat,
+    batch_size: usize,
 }
 
 /// Main processing pipeline.
@@ -205,48 +226,155 @@ impl Pipeline {
             mpsc::channel::<Result<DownloadedFile>>(max_concurrent);
 
         // Channel for finished parquet files ready for upload
-        let (upload_tx, mut upload_rx) = mpsc::channel::<FinishedFile>(max_concurrent);
+        // Larger buffer to allow more queuing and avoid blocking the writer
+        let max_concurrent_uploads = self.config.sink.max_concurrent_uploads;
+        let buffer_size = max_concurrent_uploads * 4;
+        let (upload_tx, mut upload_rx) = mpsc::channel::<FinishedFile>(buffer_size);
 
-        // Spawn background uploader task
+        // Spawn background uploader task with concurrent file uploads
         let sink_storage = self.sink_storage.clone();
+        let upload_shutdown = self.shutdown.clone();
+        let part_size = self.config.sink.part_size_mb * 1024 * 1024;
+        let min_multipart_size = self.config.sink.min_multipart_size_mb * 1024 * 1024;
+        let max_concurrent_parts = self.config.sink.max_concurrent_parts;
+
         let upload_handle = tokio::spawn(async move {
             let mut delta_sink = delta_sink;
+            let mut uploads: FuturesUnordered<
+                Pin<Box<dyn Future<Output = Result<UploadResult>> + Send>>,
+            > = FuturesUnordered::new();
+
+            let mut active_uploads = 0;
             let mut files_uploaded = 0usize;
             let mut bytes_uploaded = 0usize;
+            let mut files_to_commit: Vec<FinishedFile> = Vec::new();
+            let mut channel_open = true;
 
-            while let Some(file) = upload_rx.recv().await {
-                if let Some(ref bytes) = file.bytes {
-                    info!(
-                        "Uploading parquet file {} ({} bytes, {} records)",
-                        file.filename, file.size, file.record_count
-                    );
+            const COMMIT_BATCH_SIZE: usize = 10;
 
-                    // Upload to storage
-                    if let Err(e) = sink_storage
-                        .put(file.filename.as_str(), bytes.to_vec())
-                        .await
-                    {
-                        error!("Failed to upload parquet file {}: {}", file.filename, e);
-                        continue;
-                    }
-
-                    bytes_uploaded += file.size;
+            // Helper to commit accumulated files
+            async fn commit_files(
+                delta_sink: &mut DeltaSink,
+                files_to_commit: &mut Vec<FinishedFile>,
+            ) -> usize {
+                if files_to_commit.is_empty() {
+                    return 0;
                 }
 
-                // Commit to Delta
-                match delta_sink.commit_files(&[file]).await {
+                let commit_files: Vec<FinishedFile> = files_to_commit
+                    .drain(..)
+                    .map(|f| FinishedFile {
+                        filename: f.filename,
+                        size: f.size,
+                        record_count: f.record_count,
+                        bytes: None, // Clear bytes for commit
+                    })
+                    .collect();
+
+                let count = commit_files.len();
+                match delta_sink.commit_files(&commit_files).await {
                     Ok(Some(version)) => {
-                        files_uploaded += 1;
-                        info!("Committed file to Delta Lake, version {}", version);
+                        info!(
+                            "Committed {} files to Delta Lake, version {}",
+                            count, version
+                        );
                     }
                     Ok(None) => {
-                        debug!("No commit needed (duplicate file)");
+                        debug!("No commit needed (duplicate files)");
                     }
                     Err(e) => {
-                        error!("Failed to commit to Delta: {}", e);
+                        error!("Failed to commit {} files to Delta: {}", count, e);
+                    }
+                }
+                count
+            }
+
+            loop {
+                // Check if we're done: channel closed, no pending uploads, no files to commit
+                if !channel_open && uploads.is_empty() {
+                    break;
+                }
+
+                tokio::select! {
+                    biased;
+
+                    _ = upload_shutdown.cancelled() => {
+                        info!("[upload] Shutdown requested, stopping uploads");
+                        break;
+                    }
+
+                    // Handle completed uploads
+                    Some(result) = uploads.next(), if !uploads.is_empty() => {
+                        active_uploads -= 1;
+                        match result {
+                            Ok(upload_result) => {
+                                debug!(
+                                    "[upload] Completed {} (active: {})",
+                                    upload_result.filename, active_uploads
+                                );
+                                files_uploaded += 1;
+                                bytes_uploaded += upload_result.size;
+                                files_to_commit.push(FinishedFile {
+                                    filename: upload_result.filename,
+                                    size: upload_result.size,
+                                    record_count: upload_result.record_count,
+                                    bytes: None,
+                                });
+
+                                // Batch commit every N files
+                                if files_to_commit.len() >= COMMIT_BATCH_SIZE {
+                                    commit_files(&mut delta_sink, &mut files_to_commit).await;
+                                }
+                            }
+                            Err(e) => {
+                                error!("[upload] Upload failed: {}", e);
+                            }
+                        }
+                    }
+
+                    // Accept new files if under concurrency limit
+                    result = upload_rx.recv(), if active_uploads < max_concurrent_uploads && channel_open => {
+                        match result {
+                            Some(file) => {
+                                active_uploads += 1;
+                                info!(
+                                    "[upload] Starting {} ({} bytes, {} records, active: {})",
+                                    file.filename, file.size, file.record_count, active_uploads
+                                );
+                                uploads.push(Box::pin(upload_file(
+                                    sink_storage.clone(),
+                                    file,
+                                    part_size,
+                                    min_multipart_size,
+                                    max_concurrent_parts,
+                                )));
+                            }
+                            None => {
+                                // Channel closed, but continue draining uploads
+                                channel_open = false;
+                                debug!("[upload] Channel closed, draining {} pending uploads", uploads.len());
+                            }
+                        }
                     }
                 }
             }
+
+            // Drain any remaining pending uploads
+            while let Some(result) = uploads.next().await {
+                if let Ok(upload_result) = result {
+                    files_uploaded += 1;
+                    bytes_uploaded += upload_result.size;
+                    files_to_commit.push(FinishedFile {
+                        filename: upload_result.filename,
+                        size: upload_result.size,
+                        record_count: upload_result.record_count,
+                        bytes: None,
+                    });
+                }
+            }
+
+            // Final commit
+            commit_files(&mut delta_sink, &mut files_to_commit).await;
 
             info!(
                 "Uploader finished: {} files, {} bytes",
@@ -660,6 +788,41 @@ impl Pipeline {
             total_records,
         })
     }
+}
+
+/// Upload a single file to storage with parallel part uploads.
+async fn upload_file(
+    storage: Arc<StorageProvider>,
+    file: FinishedFile,
+    part_size: usize,
+    min_multipart_size: usize,
+    max_concurrent_parts: usize,
+) -> Result<UploadResult> {
+    let Some(bytes) = file.bytes else {
+        // No bytes means the file was already uploaded (e.g., from checkpoint recovery)
+        return Ok(UploadResult {
+            filename: file.filename,
+            size: file.size,
+            record_count: file.record_count,
+        });
+    };
+
+    let path = object_store::path::Path::from(file.filename.as_str());
+    storage
+        .put_multipart_bytes_parallel(
+            &path,
+            bytes,
+            part_size,
+            min_multipart_size,
+            max_concurrent_parts,
+        )
+        .await?;
+
+    Ok(UploadResult {
+        filename: file.filename,
+        size: file.size,
+        record_count: file.record_count,
+    })
 }
 
 /// Run the pipeline with the given configuration.

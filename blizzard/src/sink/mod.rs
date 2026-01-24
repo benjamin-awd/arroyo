@@ -3,7 +3,6 @@
 //! Provides Parquet file writing and Delta Lake commit functionality.
 
 pub mod delta;
-pub mod multipart;
 pub mod parquet;
 
 /// Information about a completed Parquet file.
