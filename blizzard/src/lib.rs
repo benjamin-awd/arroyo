@@ -7,7 +7,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use ndjson_to_delta::{Config, run_pipeline};
+//! use blizzard::{Config, run_pipeline};
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {

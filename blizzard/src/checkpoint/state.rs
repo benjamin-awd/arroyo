@@ -16,6 +16,77 @@ pub struct PendingFile {
     pub record_count: usize,
 }
 
+/// State of a file write operation for checkpoint recovery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FileWriteState {
+    /// Simple single-PUT upload (for small files).
+    SinglePut {
+        filename: String,
+        record_count: usize,
+    },
+    /// Multipart upload not yet initialized.
+    MultipartPending {
+        filename: String,
+        parts_data: Vec<Vec<u8>>,
+        record_count: usize,
+    },
+    /// Multipart upload in progress.
+    MultipartInFlight {
+        filename: String,
+        completed_parts: Vec<CompletedPart>,
+        in_flight_parts: Vec<InFlightPart>,
+        record_count: usize,
+    },
+    /// Multipart upload complete, ready for Delta commit.
+    MultipartComplete {
+        filename: String,
+        parts: Vec<String>,
+        size: usize,
+        record_count: usize,
+    },
+}
+
+/// A completed part in a multipart upload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletedPart {
+    pub part_index: usize,
+    pub content_id: String,
+}
+
+/// An in-flight part that needs to be re-uploaded on recovery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InFlightPart {
+    pub part_index: usize,
+    pub data: Vec<u8>,
+}
+
+impl FileWriteState {
+    /// Get the filename for this write state.
+    pub fn filename(&self) -> &str {
+        match self {
+            FileWriteState::SinglePut { filename, .. } => filename,
+            FileWriteState::MultipartPending { filename, .. } => filename,
+            FileWriteState::MultipartInFlight { filename, .. } => filename,
+            FileWriteState::MultipartComplete { filename, .. } => filename,
+        }
+    }
+
+    /// Get the record count for this write state.
+    pub fn record_count(&self) -> usize {
+        match self {
+            FileWriteState::SinglePut { record_count, .. } => *record_count,
+            FileWriteState::MultipartPending { record_count, .. } => *record_count,
+            FileWriteState::MultipartInFlight { record_count, .. } => *record_count,
+            FileWriteState::MultipartComplete { record_count, .. } => *record_count,
+        }
+    }
+
+    /// Check if the write is complete and ready for commit.
+    pub fn is_complete(&self) -> bool {
+        matches!(self, FileWriteState::SinglePut { .. } | FileWriteState::MultipartComplete { .. })
+    }
+}
+
 /// Complete checkpoint state for recovery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointState {
@@ -23,6 +94,9 @@ pub struct CheckpointState {
     pub source_state: SourceState,
     /// Files written but not yet committed to Delta.
     pub pending_files: Vec<PendingFile>,
+    /// In-progress file writes (for multipart upload recovery).
+    #[serde(default)]
+    pub in_progress_writes: Vec<FileWriteState>,
     /// Last committed Delta version.
     pub delta_version: i64,
 }
@@ -32,6 +106,7 @@ impl Default for CheckpointState {
         Self {
             source_state: SourceState::new(),
             pending_files: Vec::new(),
+            in_progress_writes: Vec::new(),
             delta_version: -1,
         }
     }
@@ -52,8 +127,39 @@ impl CheckpointState {
         Self {
             source_state,
             pending_files,
+            in_progress_writes: Vec::new(),
             delta_version,
         }
+    }
+
+    /// Create a checkpoint state with in-progress writes.
+    pub fn from_parts_with_writes(
+        source_state: SourceState,
+        pending_files: Vec<PendingFile>,
+        in_progress_writes: Vec<FileWriteState>,
+        delta_version: i64,
+    ) -> Self {
+        Self {
+            source_state,
+            pending_files,
+            in_progress_writes,
+            delta_version,
+        }
+    }
+
+    /// Check if there are in-progress writes.
+    pub fn has_in_progress_writes(&self) -> bool {
+        !self.in_progress_writes.is_empty()
+    }
+
+    /// Add an in-progress write.
+    pub fn add_in_progress_write(&mut self, write: FileWriteState) {
+        self.in_progress_writes.push(write);
+    }
+
+    /// Clear in-progress writes.
+    pub fn clear_in_progress_writes(&mut self) {
+        self.in_progress_writes.clear();
     }
 
     /// Check if there are pending files.
@@ -150,5 +256,56 @@ mod tests {
 
         assert_eq!(restored.delta_version, 5);
         assert_eq!(restored.pending_files.len(), 1);
+    }
+
+    #[test]
+    fn test_file_write_state_serialization() {
+        let state = FileWriteState::MultipartInFlight {
+            filename: "test.parquet".to_string(),
+            completed_parts: vec![
+                CompletedPart {
+                    part_index: 0,
+                    content_id: "etag1".to_string(),
+                },
+            ],
+            in_flight_parts: vec![
+                InFlightPart {
+                    part_index: 1,
+                    data: vec![1, 2, 3, 4],
+                },
+            ],
+            record_count: 1000,
+        };
+
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: FileWriteState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.filename(), "test.parquet");
+        assert_eq!(restored.record_count(), 1000);
+        assert!(!restored.is_complete());
+    }
+
+    #[test]
+    fn test_checkpoint_with_in_progress_writes() {
+        let state = CheckpointState::from_parts_with_writes(
+            SourceState::new(),
+            vec![],
+            vec![
+                FileWriteState::MultipartInFlight {
+                    filename: "upload.parquet".to_string(),
+                    completed_parts: vec![],
+                    in_flight_parts: vec![],
+                    record_count: 500,
+                },
+            ],
+            3,
+        );
+
+        let json = state.to_json().unwrap();
+        let restored = CheckpointState::from_json(&json).unwrap();
+
+        assert!(restored.has_in_progress_writes());
+        assert_eq!(restored.in_progress_writes.len(), 1);
+        assert_eq!(restored.in_progress_writes[0].filename(), "upload.parquet");
     }
 }

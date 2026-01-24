@@ -111,8 +111,9 @@ impl Write for SharedBuffer {
 pub struct ParquetWriterConfig {
     /// Target file size in bytes (used as default for SizeLimit rolling policy).
     pub target_file_size: usize,
-    /// Max records per row group (for memory management).
-    pub max_records_per_row_group: usize,
+    /// Target row group size in bytes (for memory management).
+    /// Row groups are flushed when in_progress_size exceeds this threshold.
+    pub row_group_size_bytes: usize,
     /// Compression codec.
     pub compression: ParquetCompression,
     /// Rolling policies that determine when to roll files.
@@ -124,7 +125,7 @@ impl Default for ParquetWriterConfig {
         let target_file_size = 10 * 1024 * 1024; // 10MB for testing
         Self {
             target_file_size,
-            max_records_per_row_group: 100_000, // 100k records per row group
+            row_group_size_bytes: 128 * 1024 * 1024, // 128MB row group size
             compression: ParquetCompression::Snappy,
             rolling_policies: vec![RollingPolicy::SizeLimit(target_file_size)],
         }
@@ -151,6 +152,12 @@ impl ParquetWriterConfig {
         self.rolling_policies = policies;
         self
     }
+
+    /// Set the row group size in bytes.
+    pub fn with_row_group_size_bytes(mut self, size_bytes: usize) -> Self {
+        self.row_group_size_bytes = size_bytes;
+        self
+    }
 }
 
 /// Parquet file writer that buffers batches and writes files.
@@ -171,10 +178,11 @@ impl ParquetWriter {
     /// Create a new Parquet writer.
     pub fn new(schema: SchemaRef, config: ParquetWriterConfig) -> Self {
         tracing::info!(
-            "Creating ParquetWriter with config: target_file_size={} bytes ({:.2} MB), max_records_per_row_group={}, rolling_policies={:?}",
+            "Creating ParquetWriter with config: target_file_size={} bytes ({:.2} MB), row_group_size_bytes={} ({:.2} MB), rolling_policies={:?}",
             config.target_file_size,
             config.target_file_size as f64 / 1024.0 / 1024.0,
-            config.max_records_per_row_group,
+            config.row_group_size_bytes,
+            config.row_group_size_bytes as f64 / 1024.0 / 1024.0,
             config.rolling_policies
         );
         let buffer = SharedBuffer::new(64 * 1024 * 1024); // 64MB initial capacity
@@ -232,15 +240,17 @@ impl ParquetWriter {
         self.stats.last_write_at = Instant::now();
         self.row_group_records += batch.num_rows();
 
-        // Flush row group based on record count (more predictable than in_progress_size
-        // which estimates encoded size and can be misleading for compressible data)
-        if self.row_group_records >= self.config.max_records_per_row_group {
+        // Flush row group based on byte size (matches Arroyo's approach using in_progress_size)
+        let in_progress_size = writer.in_progress_size();
+        if in_progress_size > self.config.row_group_size_bytes {
             tracing::info!(
-                "Flushing row group: total_records={}, row_group_records={}, buffer_before={} bytes ({:.2} MB)",
+                "Flushing row group: in_progress_size={} bytes ({:.2} MB), threshold={} bytes ({:.2} MB), total_records={}, row_group_records={}",
+                in_progress_size,
+                in_progress_size as f64 / 1024.0 / 1024.0,
+                self.config.row_group_size_bytes,
+                self.config.row_group_size_bytes as f64 / 1024.0 / 1024.0,
                 self.stats.records_written,
                 self.row_group_records,
-                self.buffer.len(),
-                self.buffer.len() as f64 / 1024.0 / 1024.0
             );
             writer.flush()?;
             self.row_group_records = 0;

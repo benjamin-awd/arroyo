@@ -54,6 +54,28 @@ pub struct SinkConfig {
     #[serde(default = "default_file_size_mb")]
     pub file_size_mb: usize,
 
+    /// Target row group size in bytes (default: 128MB)
+    /// Row groups are flushed when in_progress_size exceeds this threshold
+    #[serde(default = "default_row_group_size_bytes")]
+    pub row_group_size_bytes: usize,
+
+    /// Roll file after this many seconds of inactivity (optional)
+    #[serde(default)]
+    pub inactivity_timeout_secs: Option<u64>,
+
+    /// Roll file after it's been open this long (optional)
+    #[serde(default)]
+    pub rollover_timeout_secs: Option<u64>,
+
+    /// Target size per multipart part in MB (default: 32)
+    #[serde(default = "default_part_size_mb")]
+    pub part_size_mb: usize,
+
+    /// Minimum file size in MB before using multipart upload (default: 5)
+    /// Files smaller than this use single PUT
+    #[serde(default = "default_min_multipart_size_mb")]
+    pub min_multipart_size_mb: usize,
+
     /// Storage options (credentials, region, etc.)
     #[serde(default)]
     pub storage_options: HashMap<String, String>,
@@ -65,6 +87,18 @@ pub struct SinkConfig {
 
 fn default_file_size_mb() -> usize {
     128
+}
+
+fn default_row_group_size_bytes() -> usize {
+    128 * 1024 * 1024 // 128MB
+}
+
+fn default_part_size_mb() -> usize {
+    32
+}
+
+fn default_min_multipart_size_mb() -> usize {
+    5
 }
 
 /// Checkpoint configuration for recovery.
@@ -237,6 +271,11 @@ mod tests {
             sink: SinkConfig {
                 path: "s3://bucket/output/table".to_string(),
                 file_size_mb: 128,
+                row_group_size_bytes: 128 * 1024 * 1024,
+                inactivity_timeout_secs: None,
+                rollover_timeout_secs: None,
+                part_size_mb: 32,
+                min_multipart_size_mb: 5,
                 storage_options: HashMap::new(),
                 compression: ParquetCompression::Snappy,
             },

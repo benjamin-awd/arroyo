@@ -37,7 +37,7 @@ schema:
     - name: count
       type: int64
 "#;
-        let config: ndjson_to_delta::config::Config = serde_yaml::from_str(yaml).unwrap();
+        let config: blizzard::config::Config = serde_yaml::from_str(yaml).unwrap();
 
         assert_eq!(config.source.path, "s3://bucket/input/*.ndjson.gz");
         assert_eq!(config.source.batch_size, 4096);
@@ -69,7 +69,7 @@ schema:
     - name: data
       type: string
 "#;
-        let config: ndjson_to_delta::config::Config = serde_yaml::from_str(yaml).unwrap();
+        let config: blizzard::config::Config = serde_yaml::from_str(yaml).unwrap();
 
         // Check defaults
         assert_eq!(config.source.batch_size, 8192);
@@ -79,7 +79,7 @@ schema:
 
     #[test]
     fn test_field_types() {
-        use ndjson_to_delta::config::FieldType;
+        use blizzard::config::FieldType;
 
         let types = vec![
             ("string", FieldType::String, DataType::Utf8),
@@ -106,7 +106,7 @@ schema:
 "#,
                 name
             );
-            let config: ndjson_to_delta::config::Config = serde_yaml::from_str(&yaml).unwrap();
+            let config: blizzard::config::Config = serde_yaml::from_str(&yaml).unwrap();
             let schema = config.to_arrow_schema();
             assert_eq!(
                 schema.field(0).data_type(),
@@ -119,7 +119,7 @@ schema:
 }
 
 mod storage_tests {
-    use ndjson_to_delta::storage::BackendConfig;
+    use blizzard::storage::BackendConfig;
 
     #[test]
     fn test_s3_url_parsing() {
@@ -190,7 +190,7 @@ mod storage_tests {
 
 mod source_tests {
     use super::*;
-    use ndjson_to_delta::source::reader::parse_json_line;
+    use blizzard::source::reader::parse_json_line;
 
     fn test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -251,8 +251,8 @@ mod source_tests {
 }
 
 mod checkpoint_tests {
-    use ndjson_to_delta::checkpoint::{CheckpointState, PendingFile};
-    use ndjson_to_delta::source::{FileReadState, SourceState};
+    use blizzard::checkpoint::{CheckpointState, PendingFile};
+    use blizzard::source::{FileReadState, SourceState};
 
     #[test]
     fn test_checkpoint_state_serialization() {
@@ -334,8 +334,8 @@ mod checkpoint_tests {
 
 mod parquet_tests {
     use super::*;
-    use ndjson_to_delta::config::ParquetCompression;
-    use ndjson_to_delta::sink::parquet::{ParquetWriter, ParquetWriterConfig};
+    use blizzard::config::ParquetCompression;
+    use blizzard::sink::parquet::{ParquetWriter, ParquetWriterConfig};
 
     fn test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -398,7 +398,7 @@ mod parquet_tests {
 
 mod sink_tests {
     use super::*;
-    use ndjson_to_delta::sink::FinishedFile;
+    use blizzard::sink::FinishedFile;
 
     #[test]
     fn test_finished_file() {

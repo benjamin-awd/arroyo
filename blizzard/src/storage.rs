@@ -11,7 +11,7 @@ use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
-use object_store::{ObjectStore, PutPayload, RetryConfig};
+use object_store::{ObjectStore, PutPayload, RetryConfig, MultipartUpload, WriteMultipart};
 use regex::Regex;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -528,6 +528,36 @@ impl StorageProvider {
             Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Start a multipart upload, returning a WriteMultipart handle.
+    ///
+    /// This is the preferred method for uploading large files as it allows
+    /// streaming data in parts without buffering the entire file in memory.
+    pub async fn start_multipart(&self, path: &Path) -> Result<Box<dyn MultipartUpload>> {
+        let path = self.qualify_path(path);
+        let upload = self.object_store.put_multipart(&path).await?;
+        Ok(upload)
+    }
+
+    /// Create a WriteMultipart for buffered multipart uploads.
+    ///
+    /// This provides a higher-level interface that handles part sizing and
+    /// upload coordination automatically.
+    pub async fn create_write_multipart(&self, path: &Path) -> Result<WriteMultipart> {
+        let path = self.qualify_path(path);
+        let upload = self.object_store.put_multipart(&path).await?;
+        Ok(WriteMultipart::new(upload))
+    }
+
+    /// Abort a multipart upload.
+    ///
+    /// Note: This requires having the MultipartUpload handle. If the handle
+    /// is lost (e.g., process crash), the upload will be automatically cleaned
+    /// up by the storage provider after some time (provider-specific).
+    pub async fn abort_multipart(&self, mut upload: Box<dyn MultipartUpload>) -> Result<()> {
+        upload.abort().await?;
+        Ok(())
     }
 
     /// Get the canonical URL for this storage location.

@@ -224,6 +224,55 @@ pub async fn load_or_create_table(
     }
 }
 
+/// Check if any of the finished files already exist in the table.
+///
+/// This uses version comparison to skip the check if the table hasn't changed,
+/// then falls back to checking existing file URIs if needed.
+///
+/// Returns `Some(version)` if files were already committed,
+/// or `None` if files are new.
+async fn check_existing_files(
+    table: &DeltaTable,
+    last_version: i64,
+    finished_files: &[FinishedFile],
+) -> Result<Option<i64>> {
+    let current_version = table.version().unwrap_or_default();
+
+    // If table version hasn't changed since our last commit, files can't be duplicates
+    if last_version >= current_version {
+        debug!(
+            "Table version {} hasn't changed since last commit {}, skipping duplicate check",
+            current_version, last_version
+        );
+        return Ok(None);
+    }
+
+    // Table has new commits - check if our files exist
+    let files: HashSet<_> = finished_files
+        .iter()
+        .map(|f| f.filename.trim_start_matches('/').to_string())
+        .collect();
+
+    // Check current table files for duplicates
+    let existing_files: HashSet<String> = table
+        .get_file_uris()?
+        .into_iter()
+        .map(|p| p.to_string())
+        .collect();
+
+    for file in &files {
+        if existing_files.contains(file) {
+            debug!(
+                "File {} already exists in table at version {}",
+                file, current_version
+            );
+            return Ok(Some(current_version));
+        }
+    }
+
+    Ok(None)
+}
+
 /// Commit files to a Delta Lake table with duplicate detection.
 pub async fn commit_files_to_delta(
     finished_files: &[FinishedFile],
@@ -234,25 +283,18 @@ pub async fn commit_files_to_delta(
         return Ok(None);
     }
 
-    // Check for duplicate files by looking at existing files in the table
-    let existing_files: HashSet<String> = table
-        .get_file_uris()?
-        .into_iter()
-        .map(|p| p.to_string())
-        .collect();
-
-    let new_files: Vec<_> = finished_files
-        .iter()
-        .filter(|f| !existing_files.contains(&f.filename.trim_start_matches('/').to_string()))
-        .collect();
-
-    if new_files.is_empty() {
-        debug!("All files already committed, skipping");
-        return Ok(Some(table.version().unwrap_or(last_version)));
+    // Check for duplicate files using version range check (matches Arroyo's approach)
+    if let Some(existing_version) = check_existing_files(table, last_version, finished_files).await?
+    {
+        debug!(
+            "Files already committed at version {}, skipping",
+            existing_version
+        );
+        return Ok(Some(existing_version));
     }
 
     // Create add actions for new files
-    let add_actions: Vec<Action> = new_files
+    let add_actions: Vec<Action> = finished_files
         .iter()
         .map(|file| create_add_action(file))
         .collect();

@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, error, info};
 
@@ -12,7 +13,7 @@ use crate::checkpoint::{CheckpointCoordinator, PendingFile};
 use crate::config::Config;
 use crate::sink::FinishedFile;
 use crate::sink::delta::DeltaSink;
-use crate::sink::parquet::{ParquetWriter, ParquetWriterConfig};
+use crate::sink::parquet::{ParquetWriter, ParquetWriterConfig, RollingPolicy};
 use crate::source::reader::{NdjsonReader, create_batch_reader};
 use crate::storage::{StorageProvider, StorageProviderRef, list_ndjson_files};
 
@@ -138,9 +139,15 @@ impl Pipeline {
 
         // Create reader and writer
         let reader = NdjsonReader::new(schema.clone(), self.config.source.batch_size);
+
+        // Build rolling policies from config
+        let rolling_policies = self.build_rolling_policies();
+
         let writer_config = ParquetWriterConfig::default()
             .with_file_size_mb(self.config.sink.file_size_mb)
-            .with_compression(self.config.sink.compression);
+            .with_row_group_size_bytes(self.config.sink.row_group_size_bytes)
+            .with_compression(self.config.sink.compression)
+            .with_rolling_policies(rolling_policies);
 
         let mut writer = ParquetWriter::new(schema, writer_config);
 
@@ -228,6 +235,29 @@ impl Pipeline {
         info!("Final Delta table version: {}", delta_sink.version());
 
         Ok(self.stats.clone())
+    }
+
+    /// Build rolling policies from configuration.
+    fn build_rolling_policies(&self) -> Vec<RollingPolicy> {
+        let mut policies = Vec::new();
+
+        // Always include size-based rolling
+        let size_bytes = self.config.sink.file_size_mb * 1024 * 1024;
+        policies.push(RollingPolicy::SizeLimit(size_bytes));
+
+        // Add inactivity timeout if configured
+        if let Some(secs) = self.config.sink.inactivity_timeout_secs {
+            policies.push(RollingPolicy::InactivityDuration(Duration::from_secs(secs)));
+            debug!("Added inactivity rolling policy: {} seconds", secs);
+        }
+
+        // Add rollover timeout if configured
+        if let Some(secs) = self.config.sink.rollover_timeout_secs {
+            policies.push(RollingPolicy::RolloverDuration(Duration::from_secs(secs)));
+            debug!("Added rollover rolling policy: {} seconds", secs);
+        }
+
+        policies
     }
 
     /// List source NDJSON files.

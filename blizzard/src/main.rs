@@ -167,6 +167,11 @@ fn build_config(args: &Args) -> Result<Config> {
         sink: config::SinkConfig {
             path: sink,
             file_size_mb: args.file_size_mb,
+            row_group_size_bytes: 128 * 1024 * 1024, // 128MB default
+            inactivity_timeout_secs: None,
+            rollover_timeout_secs: None,
+            part_size_mb: 32,
+            min_multipart_size_mb: 5,
             storage_options: std::collections::HashMap::new(),
             compression: config::ParquetCompression::Snappy,
         },

@@ -210,6 +210,7 @@ impl CheckpointCoordinator {
         let state = CheckpointState {
             source_state: self.source_state.lock().await.clone(),
             pending_files: self.pending_files.lock().await.clone(),
+            in_progress_writes: Vec::new(),
             delta_version: *self.delta_version.lock().await,
         };
 
@@ -242,6 +243,7 @@ mod tests {
                 filename: "pending.parquet".to_string(),
                 record_count: 50,
             }],
+            in_progress_writes: Vec::new(),
             delta_version: 5,
         };
 

@@ -3,9 +3,11 @@
 //! Provides Parquet file writing and Delta Lake commit functionality.
 
 pub mod delta;
+pub mod multipart;
 pub mod parquet;
 
 pub use delta::DeltaSink;
+pub use multipart::{MultipartManager, MultipartManagerBuilder, MultipartCheckpoint};
 pub use parquet::{ParquetWriter, RollingPolicy, WriterStats};
 
 /// Information about a completed Parquet file.
