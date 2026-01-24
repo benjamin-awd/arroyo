@@ -57,3 +57,9 @@ chrono = "0.4"
 
 [dev-dependencies]
 tempfile = "3.24.0"
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+
+[[bench]]
+name = "blizzard_benchmarks"
+harness = false

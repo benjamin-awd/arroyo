@@ -153,7 +153,7 @@ impl Pipeline {
 
             let records_to_skip = source_state.records_to_skip(file_path);
 
-            info!(
+            debug!(
                 "Processing file: {}, skipping {} records",
                 self.source_storage.canonical_url_for(file_path),
                 records_to_skip
@@ -176,7 +176,7 @@ impl Pipeline {
                         .await;
                     self.stats.files_processed += 1;
                     self.stats.records_processed += records;
-                    info!(
+                    debug!(
                         "Finished file: {}, {} records (parquet: total={}, row_group={})",
                         self.source_storage.canonical_url_for(file_path),
                         records,

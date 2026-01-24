@@ -6,7 +6,7 @@ pub mod delta;
 pub mod parquet;
 
 pub use delta::DeltaSink;
-pub use parquet::ParquetWriter;
+pub use parquet::{ParquetWriter, RollingPolicy, WriterStats};
 
 /// Information about a completed Parquet file.
 #[derive(Debug, Clone)]

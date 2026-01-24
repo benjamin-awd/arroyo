@@ -12,10 +12,62 @@ use parquet::basic::{GzipLevel, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use super::FinishedFile;
 use crate::config::ParquetCompression;
+
+/// Statistics for tracking writer state (matches Arroyo's MultiPartWriterStats).
+#[derive(Debug, Clone, Copy)]
+pub struct WriterStats {
+    /// Total bytes written to the buffer (compressed).
+    pub bytes_written: usize,
+    /// Total records written.
+    pub records_written: usize,
+    /// Time of first write.
+    pub first_write_at: Instant,
+    /// Time of last write.
+    pub last_write_at: Instant,
+}
+
+impl WriterStats {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            bytes_written: 0,
+            records_written: 0,
+            first_write_at: now,
+            last_write_at: now,
+        }
+    }
+}
+
+/// Policy for when to roll files (matches Arroyo's RollingPolicy).
+#[derive(Debug, Clone)]
+pub enum RollingPolicy {
+    /// Roll when file reaches this size in bytes.
+    SizeLimit(usize),
+    /// Roll after this duration of inactivity.
+    InactivityDuration(Duration),
+    /// Roll after file has been open this long.
+    RolloverDuration(Duration),
+}
+
+impl RollingPolicy {
+    /// Check if the file should be rolled based on this policy.
+    pub fn should_roll(&self, stats: &WriterStats) -> bool {
+        match self {
+            RollingPolicy::SizeLimit(limit) => stats.bytes_written >= *limit,
+            RollingPolicy::InactivityDuration(duration) => {
+                stats.last_write_at.elapsed() >= *duration
+            }
+            RollingPolicy::RolloverDuration(duration) => {
+                stats.first_write_at.elapsed() >= *duration
+            }
+        }
+    }
+}
 
 /// A buffer with interior mutability for the ArrowWriter.
 #[derive(Clone)]
@@ -57,20 +109,24 @@ impl Write for SharedBuffer {
 /// Configuration for the Parquet writer.
 #[derive(Debug, Clone)]
 pub struct ParquetWriterConfig {
-    /// Target file size in bytes.
+    /// Target file size in bytes (used as default for SizeLimit rolling policy).
     pub target_file_size: usize,
     /// Max records per row group (for memory management).
     pub max_records_per_row_group: usize,
     /// Compression codec.
     pub compression: ParquetCompression,
+    /// Rolling policies that determine when to roll files.
+    pub rolling_policies: Vec<RollingPolicy>,
 }
 
 impl Default for ParquetWriterConfig {
     fn default() -> Self {
+        let target_file_size = 10 * 1024 * 1024; // 10MB for testing
         Self {
-            target_file_size: 10 * 1024 * 1024, // 10MB for testing
+            target_file_size,
             max_records_per_row_group: 100_000, // 100k records per row group
             compression: ParquetCompression::Snappy,
+            rolling_policies: vec![RollingPolicy::SizeLimit(target_file_size)],
         }
     }
 }
@@ -79,12 +135,20 @@ impl ParquetWriterConfig {
     /// Create a new config with a target file size in MB.
     pub fn with_file_size_mb(mut self, size_mb: usize) -> Self {
         self.target_file_size = size_mb * 1024 * 1024;
+        // Update the default SizeLimit policy if present
+        self.rolling_policies = vec![RollingPolicy::SizeLimit(self.target_file_size)];
         self
     }
 
     /// Set the compression codec.
     pub fn with_compression(mut self, compression: ParquetCompression) -> Self {
         self.compression = compression;
+        self
+    }
+
+    /// Set the rolling policies.
+    pub fn with_rolling_policies(mut self, policies: Vec<RollingPolicy>) -> Self {
+        self.rolling_policies = policies;
         self
     }
 }
@@ -96,7 +160,8 @@ pub struct ParquetWriter {
     writer: Option<ArrowWriter<SharedBuffer>>,
     buffer: SharedBuffer,
     current_file_name: String,
-    record_count: usize,
+    /// Writer statistics (bytes written, records, timing).
+    stats: WriterStats,
     /// Records in the current row group (resets on flush).
     row_group_records: usize,
     finished_files: Vec<FinishedFile>,
@@ -106,10 +171,11 @@ impl ParquetWriter {
     /// Create a new Parquet writer.
     pub fn new(schema: SchemaRef, config: ParquetWriterConfig) -> Self {
         tracing::info!(
-            "Creating ParquetWriter with config: target_file_size={} bytes ({:.2} MB), max_records_per_row_group={}",
+            "Creating ParquetWriter with config: target_file_size={} bytes ({:.2} MB), max_records_per_row_group={}, rolling_policies={:?}",
             config.target_file_size,
             config.target_file_size as f64 / 1024.0 / 1024.0,
-            config.max_records_per_row_group
+            config.max_records_per_row_group,
+            config.rolling_policies
         );
         let buffer = SharedBuffer::new(64 * 1024 * 1024); // 64MB initial capacity
         let writer = Self::create_writer(&schema, &config, buffer.clone());
@@ -121,7 +187,7 @@ impl ParquetWriter {
             writer: Some(writer),
             buffer,
             current_file_name,
-            record_count: 0,
+            stats: WriterStats::new(),
             row_group_records: 0,
             finished_files: Vec::new(),
         }
@@ -162,7 +228,8 @@ impl ParquetWriter {
         let writer = self.writer.as_mut().expect("Writer should be available");
 
         writer.write(batch)?;
-        self.record_count += batch.num_rows();
+        self.stats.records_written += batch.num_rows();
+        self.stats.last_write_at = Instant::now();
         self.row_group_records += batch.num_rows();
 
         // Flush row group based on record count (more predictable than in_progress_size
@@ -170,42 +237,39 @@ impl ParquetWriter {
         if self.row_group_records >= self.config.max_records_per_row_group {
             tracing::info!(
                 "Flushing row group: total_records={}, row_group_records={}, buffer_before={} bytes ({:.2} MB)",
-                self.record_count,
+                self.stats.records_written,
                 self.row_group_records,
                 self.buffer.len(),
                 self.buffer.len() as f64 / 1024.0 / 1024.0
             );
             writer.flush()?;
             self.row_group_records = 0;
+            // Update bytes_written after flush (like Arroyo)
+            self.stats.bytes_written = self.buffer.len();
             tracing::info!(
-                "After flush: buffer={} bytes ({:.2} MB)",
+                "After flush: buffer={} bytes ({:.2} MB), bytes_written={}",
                 self.buffer.len(),
-                self.buffer.len() as f64 / 1024.0 / 1024.0
+                self.buffer.len() as f64 / 1024.0 / 1024.0,
+                self.stats.bytes_written
             );
         }
 
-        // Check if we need to roll the file (based on actual compressed size)
-        let buffer_len = self.buffer.len();
-        let target = self.config.target_file_size;
-        if buffer_len > target {
+        // Check rolling policies
+        if self
+            .config
+            .rolling_policies
+            .iter()
+            .any(|p| p.should_roll(&self.stats))
+        {
             tracing::info!(
-                "Rolling file: buffer={} bytes ({:.2} MB) > target={} bytes ({:.2} MB), records={}",
-                buffer_len,
-                buffer_len as f64 / 1024.0 / 1024.0,
-                target,
-                target as f64 / 1024.0 / 1024.0,
-                self.record_count
+                "Rolling file due to policy: bytes_written={} ({:.2} MB), records={}, first_write={:?} ago, last_write={:?} ago",
+                self.stats.bytes_written,
+                self.stats.bytes_written as f64 / 1024.0 / 1024.0,
+                self.stats.records_written,
+                self.stats.first_write_at.elapsed(),
+                self.stats.last_write_at.elapsed()
             );
             self.roll_file()?;
-        } else if buffer_len > 5 * 1024 * 1024 && self.row_group_records == 0 {
-            // Log when buffer is getting large (right after flush)
-            tracing::info!(
-                "Buffer size check after flush: buffer={} bytes ({:.2} MB), target={} bytes ({:.2} MB)",
-                buffer_len,
-                buffer_len as f64 / 1024.0 / 1024.0,
-                target,
-                target as f64 / 1024.0 / 1024.0
-            );
         }
 
         Ok(())
@@ -220,7 +284,7 @@ impl ParquetWriter {
         let finished = FinishedFile {
             filename: self.current_file_name.clone(),
             size: self.buffer.len(),
-            record_count: self.record_count,
+            record_count: self.stats.records_written,
         };
         self.finished_files.push(finished);
 
@@ -232,7 +296,7 @@ impl ParquetWriter {
             self.buffer.clone(),
         ));
         self.current_file_name = Self::generate_filename();
-        self.record_count = 0;
+        self.stats = WriterStats::new();
         self.row_group_records = 0;
 
         Ok(())
@@ -259,14 +323,14 @@ impl ParquetWriter {
 
     /// Close the current file and get all finished files.
     pub fn close(mut self) -> Result<(Vec<FinishedFile>, Option<Bytes>)> {
-        if self.record_count > 0 {
+        if self.stats.records_written > 0 {
             let writer = self.writer.take().expect("Writer should be available");
             writer.close()?;
 
             let finished = FinishedFile {
                 filename: self.current_file_name.clone(),
                 size: self.buffer.len(),
-                record_count: self.record_count,
+                record_count: self.stats.records_written,
             };
             self.finished_files.push(finished);
 
@@ -289,7 +353,7 @@ impl ParquetWriter {
 
     /// Get the number of records in the current file.
     pub fn current_record_count(&self) -> usize {
-        self.record_count
+        self.stats.records_written
     }
 
     /// Get the number of records in the current row group.
@@ -310,7 +374,12 @@ impl ParquetWriter {
 
     /// Check if there are any unflushed bytes.
     pub fn has_unflushed_data(&self) -> bool {
-        self.record_count > 0
+        self.stats.records_written > 0
+    }
+
+    /// Get the current writer statistics.
+    pub fn stats(&self) -> &WriterStats {
+        &self.stats
     }
 }
 
