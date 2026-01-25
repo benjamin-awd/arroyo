@@ -71,20 +71,20 @@ async fn health_handler() -> &'static str {
 
 /// Macro for emitting metric events (Vector-style pattern).
 ///
-/// This macro is a placeholder for future event emission functionality.
-/// Currently it's a no-op but provides the API surface for instrumenting
-/// the codebase with metrics.
+/// This macro calls the `InternalEvent::emit()` method on the given event,
+/// which records the corresponding Prometheus counter metric.
 ///
 /// # Example
 ///
 /// ```ignore
+/// use blizzard::internal_events::{RecordsProcessed, BytesWritten};
+///
 /// emit!(RecordsProcessed { count: 100 });
 /// emit!(BytesWritten { bytes: 1024 });
 /// ```
 #[macro_export]
 macro_rules! emit {
-    ($($tokens:tt)*) => {
-        // Placeholder for future metric emission
-        // Will be expanded to support various metric types
+    ($event:expr) => {
+        $crate::internal_events::InternalEvent::emit($event)
     };
 }

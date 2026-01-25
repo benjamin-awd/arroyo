@@ -13,6 +13,8 @@ use std::sync::Arc;
 use tracing::debug;
 
 use crate::config::CompressionFormat;
+use crate::emit;
+use crate::internal_events::BytesRead;
 
 /// Configuration for the NDJSON reader.
 #[derive(Debug, Clone)]
@@ -66,6 +68,11 @@ impl NdjsonReader {
     /// * `skip_records` - Number of records to skip from the beginning (for resuming)
     /// * `path` - File path (used for error messages and logging)
     pub fn read(&self, compressed: Bytes, skip_records: usize, path: &str) -> Result<ReadResult> {
+        // Emit bytes read metric
+        emit!(BytesRead {
+            bytes: compressed.len() as u64,
+        });
+
         // Decompress
         let decompressed = match self.config.compression {
             CompressionFormat::Gzip => {

@@ -6,6 +6,7 @@
 
 mod checkpoint;
 mod config;
+mod internal_events;
 mod metrics;
 mod pipeline;
 mod sink;

@@ -24,6 +24,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::checkpoint::CheckpointCoordinator;
 use crate::config::{CompressionFormat, Config, MB};
+use crate::emit;
+use crate::internal_events::{
+    BatchesProcessed, BytesWritten, FileProcessed, FileStatus, RecordsProcessed,
+};
 use crate::sink::FinishedFile;
 use crate::sink::delta::DeltaSink;
 use crate::sink::parquet::{ParquetWriter, ParquetWriterConfig, RollingPolicy};
@@ -265,8 +269,10 @@ impl Pipeline {
                             {
                                 warn!("Skipping file with download error: {}", e);
                                 files_remaining -= 1;
+                                emit!(FileProcessed { status: FileStatus::Skipped });
                             } else {
                                 error!("Error downloading file: {}", e);
+                                emit!(FileProcessed { status: FileStatus::Failed });
                                 self.checkpoint_coordinator.checkpoint().await?;
                                 return Err(e);
                             }
@@ -289,6 +295,8 @@ impl Pipeline {
                                     debug!("[batch] {}: {} rows", short_name, batch.num_rows());
                                     writer.write_batch(batch)?;
                                     self.stats.records_processed += batch.num_rows();
+                                    emit!(RecordsProcessed { count: batch.num_rows() as u64 });
+                                    emit!(BatchesProcessed { count: 1 });
                                 }
 
                                 // Update checkpoint state
@@ -298,6 +306,7 @@ impl Pipeline {
 
                                 self.stats.files_processed += 1;
                                 files_remaining -= 1;
+                                emit!(FileProcessed { status: FileStatus::Success });
                                 info!(
                                     "[-] Finished file (remaining: {}): {} ({} records)",
                                     files_remaining, short_name, processed.total_records
@@ -308,6 +317,7 @@ impl Pipeline {
                                 for file in finished {
                                     self.stats.parquet_files_written += 1;
                                     self.stats.bytes_written += file.size;
+                                    emit!(BytesWritten { bytes: file.size as u64 });
                                     if upload_tx.send(file).await.is_err() {
                                         error!("Upload channel closed unexpectedly");
                                         break;
@@ -322,8 +332,10 @@ impl Pipeline {
                                 {
                                     warn!("Skipping file with processing error: {}", e);
                                     files_remaining -= 1;
+                                    emit!(FileProcessed { status: FileStatus::Skipped });
                                 } else {
                                     error!("Error processing file: {}", e);
+                                    emit!(FileProcessed { status: FileStatus::Failed });
                                     self.checkpoint_coordinator.checkpoint().await?;
                                     return Err(e);
                                 }
@@ -352,6 +364,9 @@ impl Pipeline {
         for file in finished_files {
             self.stats.parquet_files_written += 1;
             self.stats.bytes_written += file.size;
+            emit!(BytesWritten {
+                bytes: file.size as u64
+            });
             if upload_tx.send(file).await.is_err() {
                 error!("Upload channel closed unexpectedly during final flush");
             }
