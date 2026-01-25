@@ -12,7 +12,7 @@ use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::multipart::{MultipartStore, PartId};
 use object_store::path::Path;
-use object_store::{MultipartUpload, ObjectStore, PutPayload, RetryConfig};
+use object_store::{ObjectStore, PutPayload, RetryConfig};
 use regex::Regex;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -64,7 +64,7 @@ const AZURE_HTTPS: &str = r"^https://(?P<account>[a-z0-9]+)\.(blob|dfs)\.core\.w
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 enum Backend {
     S3,
-    GCS,
+    Gcs,
     Azure,
     Local,
 }
@@ -85,7 +85,7 @@ fn matchers() -> &'static HashMap<Backend, Vec<Regex>> {
         );
 
         m.insert(
-            Backend::GCS,
+            Backend::Gcs,
             vec![
                 Regex::new(GCS_PATH).unwrap(),
                 Regex::new(GCS_VIRTUAL).unwrap(),
@@ -125,7 +125,7 @@ pub struct S3Config {
 
 /// Google Cloud Storage configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GCSConfig {
+pub struct GcsConfig {
     pub bucket: String,
     pub key: Option<Path>,
 }
@@ -149,7 +149,7 @@ pub struct LocalConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendConfig {
     S3(S3Config),
-    GCS(GCSConfig),
+    Gcs(GcsConfig),
     Azure(AzureConfig),
     Local(LocalConfig),
 }
@@ -161,7 +161,7 @@ impl BackendConfig {
             if let Some(matches) = v.iter().filter_map(|r| r.captures(url)).next() {
                 return match k {
                     Backend::S3 => Self::parse_s3(matches),
-                    Backend::GCS => Self::parse_gcs(matches),
+                    Backend::Gcs => Self::parse_gcs(matches),
                     Backend::Azure => Self::parse_azure(matches),
                     Backend::Local => Self::parse_local(matches, with_key),
                 };
@@ -183,7 +183,7 @@ impl BackendConfig {
             .or_else(|| matches.name("region").map(|m| m.as_str().to_string()));
 
         let endpoint = std::env::var("AWS_ENDPOINT").ok().or_else(|| {
-            matches.name("endpoint").and_then(|endpoint| {
+            matches.name("endpoint").map(|endpoint| {
                 let port = matches
                     .name("port")
                     .and_then(|p| p.as_str().parse::<u16>().ok())
@@ -192,7 +192,7 @@ impl BackendConfig {
                     .name("protocol")
                     .map(|p| p.as_str())
                     .unwrap_or("https");
-                Some(format!("{}://{}:{}", protocol, endpoint.as_str(), port))
+                format!("{}://{}:{}", protocol, endpoint.as_str(), port)
             })
         });
 
@@ -215,7 +215,7 @@ impl BackendConfig {
 
         let key = matches.name("key").map(|r| r.as_str().into());
 
-        Ok(BackendConfig::GCS(GCSConfig { bucket, key }))
+        Ok(BackendConfig::Gcs(GcsConfig { bucket, key }))
     }
 
     fn parse_azure(matches: regex::Captures) -> Result<Self> {
@@ -271,7 +271,7 @@ impl BackendConfig {
     fn key(&self) -> Option<&Path> {
         match self {
             BackendConfig::S3(s3) => s3.key.as_ref(),
-            BackendConfig::GCS(gcs) => gcs.key.as_ref(),
+            BackendConfig::Gcs(gcs) => gcs.key.as_ref(),
             BackendConfig::Azure(azure) => azure.key.as_ref(),
             BackendConfig::Local(local) => local.key.as_ref(),
         }
@@ -285,7 +285,7 @@ impl StorageProvider {
 
         match config {
             BackendConfig::S3(config) => Self::construct_s3(config, options).await,
-            BackendConfig::GCS(config) => Self::construct_gcs(config).await,
+            BackendConfig::Gcs(config) => Self::construct_gcs(config).await,
             BackendConfig::Azure(config) => Self::construct_azure(config).await,
             BackendConfig::Local(config) => Self::construct_local(config).await,
         }
@@ -342,7 +342,7 @@ impl StorageProvider {
         })
     }
 
-    async fn construct_gcs(config: GCSConfig) -> Result<Self> {
+    async fn construct_gcs(config: GcsConfig) -> Result<Self> {
         let mut builder = GoogleCloudStorageBuilder::from_env().with_bucket_name(&config.bucket);
 
         let retry_config = RetryConfig {
@@ -367,7 +367,7 @@ impl StorageProvider {
         let object_store: Arc<dyn ObjectStore> = gcs_store;
 
         Ok(Self {
-            config: BackendConfig::GCS(config),
+            config: BackendConfig::Gcs(config),
             object_store,
             multipart_store,
             canonical_url,
@@ -522,64 +522,6 @@ impl StorageProvider {
         Ok(())
     }
 
-    /// Upload bytes using multipart upload for large files.
-    ///
-    /// This is more efficient for files >50MB as it:
-    /// - Uploads in parallel 32MB chunks
-    /// - Avoids memory pressure from single large PUT
-    /// - Handles retries per-part rather than whole file
-    ///
-    /// For files under `min_multipart_size`, falls back to simple PUT.
-    pub async fn put_multipart_bytes(
-        &self,
-        path: &Path,
-        bytes: Bytes,
-        part_size: usize,
-        min_multipart_size: usize,
-    ) -> Result<()> {
-        // For small files, use simple PUT
-        if bytes.len() < min_multipart_size {
-            return self.put_payload(path, PutPayload::from(bytes)).await;
-        }
-
-        let qualified_path = self.qualify_path(path);
-        let mut upload = self.object_store.put_multipart(&qualified_path).await?;
-
-        // Upload parts
-        let total_parts = (bytes.len() + part_size - 1) / part_size;
-        debug!(
-            "Starting multipart upload for {} ({} bytes, {} parts of {}MB)",
-            path,
-            bytes.len(),
-            total_parts,
-            part_size / 1024 / 1024
-        );
-
-        let mut offset = 0;
-        let mut part_num = 0;
-        while offset < bytes.len() {
-            let end = std::cmp::min(offset + part_size, bytes.len());
-            let part_data = bytes.slice(offset..end);
-
-            upload.put_part(PutPayload::from(part_data)).await?;
-
-            part_num += 1;
-            debug!(
-                "Uploaded part {}/{} ({} bytes)",
-                part_num,
-                total_parts,
-                end - offset
-            );
-            offset = end;
-        }
-
-        // Complete the upload
-        upload.complete().await?;
-        debug!("Completed multipart upload for {}", path);
-
-        Ok(())
-    }
-
     /// Upload bytes using parallel multipart upload.
     ///
     /// Uses the `MultipartStore` trait which provides explicit part numbering,
@@ -712,11 +654,11 @@ mod tests {
     fn test_gcs_url_parsing() {
         let config = BackendConfig::parse_url("gs://mybucket/path/to/data", false).unwrap();
         match config {
-            BackendConfig::GCS(gcs) => {
+            BackendConfig::Gcs(gcs) => {
                 assert_eq!(gcs.bucket, "mybucket");
                 assert_eq!(gcs.key, Some(Path::from("path/to/data")));
             }
-            _ => panic!("Expected GCS config"),
+            _ => panic!("Expected Gcs config"),
         }
     }
 

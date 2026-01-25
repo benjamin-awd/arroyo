@@ -28,6 +28,7 @@ use crate::config::{CompressionFormat, Config};
 use crate::sink::FinishedFile;
 use crate::sink::delta::DeltaSink;
 use crate::sink::parquet::{ParquetWriter, ParquetWriterConfig, RollingPolicy};
+use crate::source::{NdjsonReader, NdjsonReaderConfig};
 use crate::storage::{StorageProvider, StorageProviderRef, list_ndjson_files};
 
 /// Statistics about the pipeline run.
@@ -163,6 +164,10 @@ impl Pipeline {
             compression,
             batch_size,
         } = state;
+
+        // Create the NDJSON reader for decompression and parsing
+        let reader_config = NdjsonReaderConfig::new(batch_size, compression);
+        let reader = Arc::new(NdjsonReader::new(schema.clone(), reader_config));
 
         info!(
             "Processing files with max_concurrent_files={} (download-then-decompress mode)",
@@ -392,11 +397,9 @@ impl Pipeline {
                     }
                 };
 
-                if should_continue {
-                    if download_tx.send(result).await.is_err() {
-                        debug!("[download] Consumer closed, stopping downloads");
-                        break;
-                    }
+                if should_continue && download_tx.send(result).await.is_err() {
+                    debug!("[download] Consumer closed, stopping downloads");
+                    break;
                 }
 
                 // Start next download if available
@@ -423,28 +426,25 @@ impl Pipeline {
         > = FuturesUnordered::new();
         let mut channel_open = true;
 
-        // Helper to spawn a decompression task
-        let spawn_decompress =
-            |downloaded: DownloadedFile, schema: Arc<arrow::datatypes::Schema>| {
-                let path = downloaded.path.clone();
-                let task: std::pin::Pin<
-                    Box<dyn std::future::Future<Output = Result<ProcessedFile>> + Send>,
-                > = Box::pin(async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        Self::decompress_and_parse(
-                            downloaded.compressed_data,
-                            compression,
-                            schema,
-                            batch_size,
-                            downloaded.skip_records,
-                            &path,
-                        )
-                    })
-                    .await??;
-                    Ok(result)
-                });
-                task
-            };
+        // Helper to spawn a read task (decompress + parse)
+        let spawn_read = |downloaded: DownloadedFile, reader: Arc<NdjsonReader>| {
+            let path = downloaded.path.clone();
+            let path_for_result = path.clone();
+            let task: std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<ProcessedFile>> + Send>,
+            > = Box::pin(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    reader.read(downloaded.compressed_data, downloaded.skip_records, &path)
+                })
+                .await??;
+                Ok(ProcessedFile {
+                    path: path_for_result,
+                    batches: result.batches,
+                    total_records: result.total_records,
+                })
+            });
+            task
+        };
 
         loop {
             if self.shutdown.is_cancelled() {
@@ -468,7 +468,7 @@ impl Pipeline {
                 result = download_rx.recv(), if has_capacity => {
                     match result {
                         Some(Ok(downloaded)) => {
-                            processing.push(spawn_decompress(downloaded, schema.clone()));
+                            processing.push(spawn_read(downloaded, reader.clone()));
                         }
                         Some(Err(e)) => {
                             let error_str = e.to_string();
@@ -495,7 +495,7 @@ impl Pipeline {
                     if let Some(result) = result {
                         match result {
                             Ok(processed) => {
-                                let short_name = processed.path.split('/').last().unwrap_or(&processed.path);
+                                let short_name = processed.path.split('/').next_back().unwrap_or(&processed.path);
 
                                 // Write all batches from this file
                                 for batch in &processed.batches {
@@ -722,112 +722,6 @@ impl Pipeline {
             path,
             compressed_data,
             skip_records,
-        })
-    }
-
-    /// Decompress and parse a file's data (runs in rayon thread pool).
-    fn decompress_and_parse(
-        compressed: Bytes,
-        compression: CompressionFormat,
-        schema: Arc<arrow::datatypes::Schema>,
-        batch_size: usize,
-        skip_records: usize,
-        path: &str,
-    ) -> Result<ProcessedFile> {
-        use arrow_json::reader::ReaderBuilder;
-        use std::io::Read;
-
-        // Decompress
-        let decompressed = match compression {
-            CompressionFormat::Gzip => {
-                let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
-                let mut buf = Vec::new();
-                decoder.read_to_end(&mut buf).map_err(|e| {
-                    anyhow::anyhow!("Gzip decompression failed for {}: {}", path, e)
-                })?;
-                buf
-            }
-            CompressionFormat::Zstd => zstd::decode_all(&compressed[..])
-                .map_err(|e| anyhow::anyhow!("Zstd decompression failed for {}: {}", path, e))?,
-            CompressionFormat::None => compressed.to_vec(),
-        };
-
-        debug!(
-            "Decompressed {} -> {} bytes for {}",
-            compressed.len(),
-            decompressed.len(),
-            path
-        );
-
-        // Parse JSON to batches
-        let mut decoder = ReaderBuilder::new(schema)
-            .with_batch_size(batch_size)
-            .with_strict_mode(false)
-            .build_decoder()
-            .map_err(|e| anyhow::anyhow!("Failed to build JSON decoder: {}", e))?;
-
-        // Decode and flush in interleaved fashion - decode() stops after batch_size records,
-        // so we must flush after each decode to get all records
-        let mut offset = 0;
-        let mut batches = Vec::new();
-        let mut total_records = 0;
-        let mut records_to_skip = skip_records;
-
-        loop {
-            let consumed = decoder
-                .decode(&decompressed[offset..])
-                .map_err(|e| anyhow::anyhow!("Failed to decode JSON for {}: {}", path, e))?;
-
-            // Flush any accumulated records after each decode
-            if let Some(batch) = decoder
-                .flush()
-                .map_err(|e| anyhow::anyhow!("Failed to flush batch for {}: {}", path, e))?
-            {
-                // Apply skip logic for checkpoint recovery
-                if records_to_skip > 0 {
-                    let batch_rows = batch.num_rows();
-                    if records_to_skip >= batch_rows {
-                        records_to_skip -= batch_rows;
-                    } else {
-                        // Partial skip
-                        let skip = records_to_skip;
-                        records_to_skip = 0;
-                        let sliced = batch.slice(skip, batch_rows - skip);
-                        total_records += sliced.num_rows();
-                        batches.push(sliced);
-                    }
-                } else {
-                    total_records += batch.num_rows();
-                    batches.push(batch);
-                }
-            }
-
-            if consumed == 0 {
-                // No progress - check if remaining bytes are just whitespace
-                let remaining = &decompressed[offset..];
-                if !remaining.iter().all(|&b| b.is_ascii_whitespace()) {
-                    debug!(
-                        "Could not parse {} trailing bytes in {}",
-                        remaining.len(),
-                        path
-                    );
-                }
-                break;
-            }
-            offset += consumed;
-        }
-
-        debug!(
-            "Parsed {} batches ({} records) from {}",
-            batches.len(),
-            total_records,
-            path
-        );
-
-        Ok(ProcessedFile {
-            path: path.to_string(),
-            batches,
-            total_records,
         })
     }
 }

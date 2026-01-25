@@ -131,7 +131,7 @@ pub async fn load_or_create_table(
                 storage_provider.qualify_path(empty_path)
             )
         }
-        BackendConfig::GCS(gcs) => {
+        BackendConfig::Gcs(gcs) => {
             format!(
                 "gs://{}/{}",
                 gcs.bucket,
@@ -213,11 +213,7 @@ async fn check_existing_files(
         .collect();
 
     // Check current table files for duplicates
-    let existing_files: HashSet<String> = table
-        .get_file_uris()?
-        .into_iter()
-        .map(|p| p.to_string())
-        .collect();
+    let existing_files: HashSet<String> = table.get_file_uris()?.map(|p| p.to_string()).collect();
 
     for file in &files {
         if existing_files.contains(file) {
@@ -254,10 +250,7 @@ pub async fn commit_files_to_delta(
     }
 
     // Create add actions for new files
-    let add_actions: Vec<Action> = finished_files
-        .iter()
-        .map(|file| create_add_action(file))
-        .collect();
+    let add_actions: Vec<Action> = finished_files.iter().map(create_add_action).collect();
 
     // Commit the actions
     let new_version = commit_to_delta(table, add_actions).await?;

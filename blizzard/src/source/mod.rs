@@ -6,4 +6,5 @@
 pub mod reader;
 pub mod state;
 
+pub use reader::{NdjsonReader, NdjsonReaderConfig};
 pub use state::SourceState;
