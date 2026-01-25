@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
+use crate::emit;
+use crate::internal_events::CheckpointSaveCompleted;
 use crate::source::SourceState;
 use crate::storage::StorageProviderRef;
 
@@ -42,6 +44,7 @@ impl CheckpointManager {
 
     /// Save a checkpoint.
     pub async fn save_checkpoint(&mut self, state: &CheckpointState) -> Result<()> {
+        let start = Instant::now();
         self.checkpoint_id += 1;
 
         let checkpoint_path = format!("checkpoint-{:010}.json", self.checkpoint_id);
@@ -64,6 +67,10 @@ impl CheckpointManager {
             .await?;
 
         self.last_checkpoint = Instant::now();
+
+        emit!(CheckpointSaveCompleted {
+            duration: start.elapsed()
+        });
 
         info!(
             "Saved checkpoint {} with {} files tracked",

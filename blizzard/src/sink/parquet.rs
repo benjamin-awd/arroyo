@@ -17,6 +17,8 @@ use uuid::Uuid;
 
 use super::FinishedFile;
 use crate::config::{MB, ParquetCompression};
+use crate::emit;
+use crate::internal_events::ParquetWriteCompleted;
 
 /// Statistics for tracking writer state.
 #[derive(Debug, Clone, Copy)]
@@ -289,6 +291,7 @@ impl ParquetWriter {
 
     /// Roll the current file and start a new one.
     fn roll_file(&mut self) -> Result<()> {
+        let start = Instant::now();
         let writer = self.writer.take().expect("Writer should be available");
         writer.close()?;
 
@@ -299,6 +302,10 @@ impl ParquetWriter {
         )
         .into_inner()
         .freeze();
+
+        emit!(ParquetWriteCompleted {
+            duration: start.elapsed()
+        });
 
         // Create finished file record with bytes
         let finished = FinishedFile {
@@ -326,10 +333,15 @@ impl ParquetWriter {
     /// All files include their parquet bytes for uploading to storage.
     pub fn close(mut self) -> Result<Vec<FinishedFile>> {
         if self.stats.records_written > 0 {
+            let start = Instant::now();
             let writer = self.writer.take().expect("Writer should be available");
             writer.close()?;
 
             let bytes = self.buffer.into_inner().freeze();
+
+            emit!(ParquetWriteCompleted {
+                duration: start.elapsed()
+            });
 
             let finished = FinishedFile {
                 filename: self.current_file_name.clone(),

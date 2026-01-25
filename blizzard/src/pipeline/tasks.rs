@@ -9,10 +9,13 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::emit;
+use crate::internal_events::FileDownloadCompleted;
 use crate::sink::FinishedFile;
 use crate::sink::delta::DeltaSink;
 use crate::source::SourceState;
@@ -315,7 +318,11 @@ async fn download_file(
     path: String,
     skip_records: usize,
 ) -> Result<DownloadedFile> {
+    let start = Instant::now();
     let compressed_data = storage.get(path.as_str()).await?;
+    emit!(FileDownloadCompleted {
+        duration: start.elapsed()
+    });
     Ok(DownloadedFile {
         path,
         compressed_data,

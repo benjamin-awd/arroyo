@@ -10,11 +10,12 @@ use arrow_json::reader::ReaderBuilder;
 use bytes::Bytes;
 use std::io::Read;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::debug;
 
 use crate::config::CompressionFormat;
 use crate::emit;
-use crate::internal_events::BytesRead;
+use crate::internal_events::{BytesRead, FileDecompressionCompleted};
 
 /// Configuration for the NDJSON reader.
 #[derive(Debug, Clone)]
@@ -74,6 +75,7 @@ impl NdjsonReader {
         });
 
         // Decompress
+        let decompress_start = Instant::now();
         let decompressed = match self.config.compression {
             CompressionFormat::Gzip => {
                 let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
@@ -87,6 +89,9 @@ impl NdjsonReader {
                 .map_err(|e| anyhow::anyhow!("Zstd decompression failed for {}: {}", path, e))?,
             CompressionFormat::None => compressed.to_vec(),
         };
+        emit!(FileDecompressionCompleted {
+            duration: decompress_start.elapsed()
+        });
 
         debug!(
             "Decompressed {} -> {} bytes for {}",

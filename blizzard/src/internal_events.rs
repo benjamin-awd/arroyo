@@ -4,7 +4,8 @@
 //! Events implement the `InternalEvent` trait which emits the corresponding
 //! Prometheus counter metric.
 
-use metrics::counter;
+use metrics::{counter, histogram};
+use std::time::Duration;
 use tracing::trace;
 
 /// Trait for internal events that can be emitted as metrics.
@@ -88,5 +89,85 @@ impl InternalEvent for BatchesProcessed {
     fn emit(self) {
         trace!(count = self.count, "Batches processed");
         counter!("blizzard_batches_processed_total").increment(self.count);
+    }
+}
+
+// ============================================================================
+// Histogram events for timing
+// ============================================================================
+
+/// Event emitted when a file download completes.
+pub struct FileDownloadCompleted {
+    pub duration: Duration,
+}
+
+impl InternalEvent for FileDownloadCompleted {
+    fn emit(self) {
+        trace!(
+            duration_ms = self.duration.as_millis(),
+            "File download completed"
+        );
+        histogram!("blizzard_file_download_duration_seconds").record(self.duration.as_secs_f64());
+    }
+}
+
+/// Event emitted when file decompression completes.
+pub struct FileDecompressionCompleted {
+    pub duration: Duration,
+}
+
+impl InternalEvent for FileDecompressionCompleted {
+    fn emit(self) {
+        trace!(
+            duration_ms = self.duration.as_millis(),
+            "File decompression completed"
+        );
+        histogram!("blizzard_file_decompression_duration_seconds")
+            .record(self.duration.as_secs_f64());
+    }
+}
+
+/// Event emitted when a Parquet file write completes.
+pub struct ParquetWriteCompleted {
+    pub duration: Duration,
+}
+
+impl InternalEvent for ParquetWriteCompleted {
+    fn emit(self) {
+        trace!(
+            duration_ms = self.duration.as_millis(),
+            "Parquet write completed"
+        );
+        histogram!("blizzard_parquet_write_duration_seconds").record(self.duration.as_secs_f64());
+    }
+}
+
+/// Event emitted when a Delta Lake commit completes.
+pub struct DeltaCommitCompleted {
+    pub duration: Duration,
+}
+
+impl InternalEvent for DeltaCommitCompleted {
+    fn emit(self) {
+        trace!(
+            duration_ms = self.duration.as_millis(),
+            "Delta commit completed"
+        );
+        histogram!("blizzard_delta_commit_duration_seconds").record(self.duration.as_secs_f64());
+    }
+}
+
+/// Event emitted when a checkpoint save completes.
+pub struct CheckpointSaveCompleted {
+    pub duration: Duration,
+}
+
+impl InternalEvent for CheckpointSaveCompleted {
+    fn emit(self) {
+        trace!(
+            duration_ms = self.duration.as_millis(),
+            "Checkpoint save completed"
+        );
+        histogram!("blizzard_checkpoint_save_duration_seconds").record(self.duration.as_secs_f64());
     }
 }

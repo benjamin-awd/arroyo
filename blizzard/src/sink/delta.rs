@@ -11,11 +11,14 @@ use deltalake::operations::create::CreateBuilder;
 use deltalake::protocol::SaveMode;
 use object_store::path::Path;
 use std::collections::HashSet;
+use std::time::Instant;
 use tracing::{debug, info};
 use url::Url;
 
 use super::FinishedFile;
 use crate::checkpoint::PendingFile;
+use crate::emit;
+use crate::internal_events::DeltaCommitCompleted;
 use crate::storage::{BackendConfig, StorageProvider, StorageProviderRef};
 
 /// Delta Lake sink for committing Parquet files.
@@ -307,6 +310,7 @@ fn create_add_action(file: &FinishedFile) -> Action {
 async fn commit_to_delta(table: &mut DeltaTable, add_actions: Vec<Action>) -> Result<i64> {
     use deltalake::kernel::transaction::CommitBuilder;
 
+    let start = Instant::now();
     let version = CommitBuilder::default()
         .with_actions(add_actions)
         .build(
@@ -323,6 +327,10 @@ async fn commit_to_delta(table: &mut DeltaTable, add_actions: Vec<Action>) -> Re
 
     // Reload table to get new state
     table.load().await?;
+
+    emit!(DeltaCommitCompleted {
+        duration: start.elapsed()
+    });
 
     Ok(version)
 }
