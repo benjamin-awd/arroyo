@@ -1090,7 +1090,6 @@ dependencies = [
  "object_store",
  "parquet 55.2.0",
  "rand 0.8.5",
- "rayon",
  "regex",
  "serde",
  "serde_json",

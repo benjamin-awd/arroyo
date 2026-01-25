@@ -16,8 +16,12 @@ use object_store::{ObjectStore, PutPayload, RetryConfig};
 use regex::Regex;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tracing::debug;
+
+use crate::emit;
+use crate::internal_events::ActiveMultipartParts;
 
 /// A reference-counted storage provider.
 pub type StorageProviderRef = Arc<StorageProvider>;
@@ -570,16 +574,26 @@ impl StorageProvider {
         let multipart_id = Arc::new(multipart_id);
         let multipart_store = multipart_store.clone();
         let qualified_path = Arc::new(qualified_path);
+        let active_parts = Arc::new(AtomicUsize::new(0));
 
         let results: Vec<(usize, PartId)> = futures::stream::iter(parts)
             .map(|(idx, data)| {
                 let multipart_store = multipart_store.clone();
                 let qualified_path = qualified_path.clone();
                 let multipart_id = multipart_id.clone();
+                let active_parts = active_parts.clone();
                 async move {
-                    let part_id = multipart_store
+                    let count = active_parts.fetch_add(1, Ordering::Relaxed) + 1;
+                    emit!(ActiveMultipartParts { count });
+
+                    let result = multipart_store
                         .put_part(&qualified_path, &multipart_id, idx, data.into())
-                        .await?;
+                        .await;
+
+                    let count = active_parts.fetch_sub(1, Ordering::Relaxed) - 1;
+                    emit!(ActiveMultipartParts { count });
+
+                    let part_id = result?;
                     debug!("Uploaded part {}/{}", idx + 1, total_parts);
                     Ok::<_, anyhow::Error>((idx, part_id))
                 }

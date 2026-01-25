@@ -7,7 +7,7 @@
 //!
 //! Uses a producer-consumer pattern to separate I/O from CPU work:
 //! - **Tokio tasks**: Download compressed files concurrently (I/O bound)
-//! - **Rayon thread pool**: Decompress and parse files in parallel (CPU bound)
+//! - **Tokio's blocking thread pool**: Decompress and parse files in parallel (CPU bound)
 //!
 //! This enables full CPU utilization during gzip decompression.
 
@@ -26,7 +26,8 @@ use crate::checkpoint::CheckpointCoordinator;
 use crate::config::{CompressionFormat, Config, MB};
 use crate::emit;
 use crate::internal_events::{
-    BatchesProcessed, BytesWritten, FileProcessed, FileStatus, RecordsProcessed,
+    BatchesProcessed, BytesWritten, DecompressionQueueDepth, FileProcessed, FileStatus,
+    PendingBatches, RecordsProcessed,
 };
 use crate::sink::FinishedFile;
 use crate::sink::delta::DeltaSink;
@@ -121,7 +122,7 @@ impl Pipeline {
     ///
     /// Uses a producer-consumer pattern to maximize parallelism:
     /// - **Producer**: Tokio tasks download compressed files concurrently (I/O bound)
-    /// - **Consumer**: Rayon thread pool decompresses and parses files (CPU bound)
+    /// - **Consumer**: Tokio's blocking thread pool decompresses and parses files (CPU bound)
     pub async fn run(&mut self) -> Result<PipelineStats> {
         info!("Starting pipeline");
 
@@ -260,6 +261,9 @@ impl Pipeline {
                     match result {
                         Some(Ok(downloaded)) => {
                             processing.push(spawn_read(downloaded, reader.clone()));
+                            emit!(DecompressionQueueDepth {
+                                count: processing.len()
+                            });
                         }
                         Some(Err(e)) => {
                             let error_str = e.to_string();
@@ -286,9 +290,17 @@ impl Pipeline {
                 // Wait for processing tasks to complete
                 result = processing.next(), if !processing.is_empty() => {
                     if let Some(result) = result {
+                        emit!(DecompressionQueueDepth {
+                            count: processing.len()
+                        });
                         match result {
                             Ok(processed) => {
                                 let short_name = processed.path.split('/').next_back().unwrap_or(&processed.path);
+
+                                // Track pending batches before writing
+                                emit!(PendingBatches {
+                                    count: processed.batches.len()
+                                });
 
                                 // Write all batches from this file
                                 for batch in &processed.batches {
@@ -298,6 +310,7 @@ impl Pipeline {
                                     emit!(RecordsProcessed { count: batch.num_rows() as u64 });
                                     emit!(BatchesProcessed { count: 1 });
                                 }
+                                emit!(PendingBatches { count: 0 });
 
                                 // Update checkpoint state
                                 self.checkpoint_coordinator

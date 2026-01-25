@@ -209,45 +209,6 @@ fn parallel_decompression_benchmarks(c: &mut Criterion) {
         });
     });
 
-    // Parallel using rayon directly (for comparison)
-    group.bench_function("parallel_rayon", |b| {
-        use rayon::prelude::*;
-
-        b.iter(|| {
-            let total: usize = compressed_files
-                .par_iter()
-                .map(|compressed| {
-                    // Decompress
-                    let mut decoder = GzDecoder::new(&compressed[..]);
-                    let mut decompressed = Vec::new();
-                    decoder.read_to_end(&mut decompressed).unwrap();
-
-                    // Parse
-                    let mut json_decoder = ReaderBuilder::new(schema.clone())
-                        .with_batch_size(8192)
-                        .with_strict_mode(false)
-                        .build_decoder()
-                        .unwrap();
-
-                    let mut count = 0;
-                    let mut offset = 0;
-                    while offset < decompressed.len() {
-                        let consumed = json_decoder.decode(&decompressed[offset..]).unwrap();
-                        if let Some(batch) = json_decoder.flush().unwrap() {
-                            count += batch.num_rows();
-                        }
-                        if consumed == 0 {
-                            break;
-                        }
-                        offset += consumed;
-                    }
-                    count
-                })
-                .sum();
-            total
-        });
-    });
-
     group.finish();
 }
 

@@ -4,7 +4,7 @@
 //! Events implement the `InternalEvent` trait which emits the corresponding
 //! Prometheus counter metric.
 
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
 use std::time::Duration;
 use tracing::trace;
 
@@ -169,5 +169,69 @@ impl InternalEvent for CheckpointSaveCompleted {
             "Checkpoint save completed"
         );
         histogram!("blizzard_checkpoint_save_duration_seconds").record(self.duration.as_secs_f64());
+    }
+}
+
+// ============================================================================
+// Gauge events for concurrency and backpressure
+// ============================================================================
+
+/// Event emitted when the number of active downloads changes.
+pub struct ActiveDownloads {
+    pub count: usize,
+}
+
+impl InternalEvent for ActiveDownloads {
+    fn emit(self) {
+        trace!(count = self.count, "Active downloads");
+        gauge!("blizzard_active_downloads").set(self.count as f64);
+    }
+}
+
+/// Event emitted when the number of active uploads changes.
+pub struct ActiveUploads {
+    pub count: usize,
+}
+
+impl InternalEvent for ActiveUploads {
+    fn emit(self) {
+        trace!(count = self.count, "Active uploads");
+        gauge!("blizzard_active_uploads").set(self.count as f64);
+    }
+}
+
+/// Event emitted when the number of in-flight multipart parts changes.
+pub struct ActiveMultipartParts {
+    pub count: usize,
+}
+
+impl InternalEvent for ActiveMultipartParts {
+    fn emit(self) {
+        trace!(count = self.count, "Active multipart parts");
+        gauge!("blizzard_active_multipart_parts").set(self.count as f64);
+    }
+}
+
+/// Event emitted when the number of pending batches changes.
+pub struct PendingBatches {
+    pub count: usize,
+}
+
+impl InternalEvent for PendingBatches {
+    fn emit(self) {
+        trace!(count = self.count, "Pending batches");
+        gauge!("blizzard_pending_batches").set(self.count as f64);
+    }
+}
+
+/// Event emitted when the decompression queue depth changes.
+pub struct DecompressionQueueDepth {
+    pub count: usize,
+}
+
+impl InternalEvent for DecompressionQueueDepth {
+    fn emit(self) {
+        trace!(count = self.count, "Decompression queue depth");
+        gauge!("blizzard_decompression_queue_depth").set(self.count as f64);
     }
 }

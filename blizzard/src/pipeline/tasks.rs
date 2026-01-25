@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::emit;
-use crate::internal_events::FileDownloadCompleted;
+use crate::internal_events::{ActiveDownloads, ActiveUploads, FileDownloadCompleted};
 use crate::sink::FinishedFile;
 use crate::sink::delta::DeltaSink;
 use crate::source::SourceState;
@@ -152,6 +152,9 @@ pub(super) async fn run_uploader(
             // Handle completed uploads
             Some(result) = uploads.next(), if !uploads.is_empty() => {
                 active_uploads -= 1;
+                emit!(ActiveUploads {
+                    count: active_uploads
+                });
                 match result {
                     Ok(upload_result) => {
                         debug!(
@@ -183,6 +186,9 @@ pub(super) async fn run_uploader(
                 match result {
                     Some(file) => {
                         active_uploads += 1;
+                        emit!(ActiveUploads {
+                            count: active_uploads
+                        });
                         info!(
                             "[upload] Starting {} ({} bytes, {} records, active: {})",
                             file.filename, file.size, file.record_count, active_uploads
@@ -222,6 +228,9 @@ pub(super) async fn run_uploader(
     // Final commit
     commit_files(&mut delta_sink, &mut files_to_commit).await;
 
+    // Reset gauge to 0 on completion
+    emit!(ActiveUploads { count: 0 });
+
     info!(
         "Uploader finished: {} files, {} bytes",
         files_uploaded, bytes_uploaded
@@ -250,6 +259,9 @@ pub(super) async fn run_downloader(
         let skip = source_state.records_to_skip(&file_path);
         let storage = storage.clone();
         active_downloads += 1;
+        emit!(ActiveDownloads {
+            count: active_downloads
+        });
         debug!(
             "[download] Starting {} (active: {})",
             file_path, active_downloads
@@ -265,6 +277,9 @@ pub(super) async fn run_downloader(
         }
 
         active_downloads -= 1;
+        emit!(ActiveDownloads {
+            count: active_downloads
+        });
 
         // Send result to consumer (decompress+parse)
         let should_continue = match &result {
@@ -301,6 +316,9 @@ pub(super) async fn run_downloader(
             let skip = source_state.records_to_skip(&next_file);
             let storage = storage.clone();
             active_downloads += 1;
+            emit!(ActiveDownloads {
+                count: active_downloads
+            });
             debug!(
                 "[download] Starting {} (active: {})",
                 next_file, active_downloads
@@ -309,6 +327,8 @@ pub(super) async fn run_downloader(
         }
     }
 
+    // Reset gauge to 0 on completion
+    emit!(ActiveDownloads { count: 0 });
     debug!("[download] All downloads complete");
 }
 
