@@ -7,13 +7,16 @@ pub mod state;
 
 pub use state::{CheckpointState, PendingFile};
 
-use anyhow::Result;
+use snafu::prelude::*;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use crate::emit;
+use crate::error::{
+    CheckpointError, CheckpointStorageSnafu, JsonSnafu, MissingCheckpointPathSnafu,
+};
 use crate::internal_events::{
     CheckpointAge, CheckpointSaveCompleted, CheckpointSaved, PendingFilesCount,
 };
@@ -47,19 +50,23 @@ impl CheckpointManager {
     }
 
     /// Save a checkpoint.
-    pub async fn save_checkpoint(&mut self, state: &CheckpointState) -> Result<()> {
+    pub async fn save_checkpoint(
+        &mut self,
+        state: &CheckpointState,
+    ) -> Result<(), CheckpointError> {
         let start = Instant::now();
         self.checkpoint_id += 1;
 
         let checkpoint_path = format!("checkpoint-{:010}.json", self.checkpoint_id);
 
         // Serialize the checkpoint state
-        let checkpoint_json = serde_json::to_string_pretty(state)?;
+        let checkpoint_json = serde_json::to_string_pretty(state).context(JsonSnafu)?;
 
         // Write to storage
         self.storage
             .put(checkpoint_path.clone(), checkpoint_json.into_bytes())
-            .await?;
+            .await
+            .context(CheckpointStorageSnafu)?;
 
         // Also write a "latest" pointer
         let latest_content = serde_json::json!({
@@ -67,8 +74,12 @@ impl CheckpointManager {
             "checkpoint_path": checkpoint_path,
         });
         self.storage
-            .put("latest.json", serde_json::to_vec(&latest_content)?)
-            .await?;
+            .put(
+                "latest.json",
+                serde_json::to_vec(&latest_content).context(JsonSnafu)?,
+            )
+            .await
+            .context(CheckpointStorageSnafu)?;
 
         self.last_checkpoint = Instant::now();
 
@@ -89,15 +100,27 @@ impl CheckpointManager {
 
     /// Load the latest checkpoint if available.
     /// Returns the checkpoint state and the checkpoint ID to restore.
-    pub async fn load_latest_checkpoint(&mut self) -> Result<Option<CheckpointState>> {
+    pub async fn load_latest_checkpoint(
+        &mut self,
+    ) -> Result<Option<CheckpointState>, CheckpointError> {
         // Check if checkpoint exists before attempting to read
-        if !self.storage.exists("latest.json").await? {
+        if !self
+            .storage
+            .exists("latest.json")
+            .await
+            .context(CheckpointStorageSnafu)?
+        {
             debug!("No checkpoint found");
             return Ok(None);
         }
 
         // Try to read the latest pointer
-        let latest_bytes = match self.storage.get_if_present("latest.json").await? {
+        let latest_bytes = match self
+            .storage
+            .get_if_present("latest.json")
+            .await
+            .context(CheckpointStorageSnafu)?
+        {
             Some(bytes) => bytes,
             None => {
                 debug!("No checkpoint found");
@@ -105,18 +128,23 @@ impl CheckpointManager {
             }
         };
 
-        let latest: serde_json::Value = serde_json::from_slice(&latest_bytes)?;
+        let latest: serde_json::Value = serde_json::from_slice(&latest_bytes).context(JsonSnafu)?;
         let checkpoint_path = latest["checkpoint_path"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Invalid latest.json: missing checkpoint_path"))?;
+            .ok_or_else(|| MissingCheckpointPathSnafu.build())?;
 
         // Restore the checkpoint ID from the latest.json so new checkpoints continue from the correct sequence
         let checkpoint_id = latest["checkpoint_id"].as_u64().unwrap_or(0);
         self.set_checkpoint_id(checkpoint_id);
 
         // Load the checkpoint
-        let checkpoint_bytes = self.storage.get(checkpoint_path).await?;
-        let checkpoint: CheckpointState = serde_json::from_slice(&checkpoint_bytes)?;
+        let checkpoint_bytes = self
+            .storage
+            .get(checkpoint_path)
+            .await
+            .context(CheckpointStorageSnafu)?;
+        let checkpoint: CheckpointState =
+            serde_json::from_slice(&checkpoint_bytes).context(JsonSnafu)?;
 
         info!(
             "Loaded checkpoint {} from {}, version {}",
@@ -162,7 +190,7 @@ impl CheckpointCoordinator {
     }
 
     /// Load the latest checkpoint and restore state.
-    pub async fn restore(&self) -> Result<Option<CheckpointState>> {
+    pub async fn restore(&self) -> Result<Option<CheckpointState>, CheckpointError> {
         let mut manager = self.manager.lock().await;
         if let Some(checkpoint) = manager.load_latest_checkpoint().await? {
             drop(manager);
@@ -207,7 +235,7 @@ impl CheckpointCoordinator {
     }
 
     /// Trigger a checkpoint.
-    pub async fn checkpoint(&self) -> Result<()> {
+    pub async fn checkpoint(&self) -> Result<(), CheckpointError> {
         let pending_files = self.pending_files.lock().await.clone();
         emit!(PendingFilesCount {
             count: pending_files.len()

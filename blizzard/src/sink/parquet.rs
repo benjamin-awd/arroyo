@@ -3,13 +3,13 @@
 //! Writes Arrow RecordBatches to Parquet files with configurable
 //! compression and file rolling based on size.
 
-use anyhow::Result;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use bytes::{BufMut, BytesMut};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{GzipLevel, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+use snafu::prelude::*;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,6 +18,7 @@ use uuid::Uuid;
 use super::FinishedFile;
 use crate::config::{MB, ParquetCompression};
 use crate::emit;
+use crate::error::{ParquetError, WriteSnafu};
 use crate::internal_events::ParquetWriteCompleted;
 
 /// Statistics for tracking writer state.
@@ -234,10 +235,10 @@ impl ParquetWriter {
     }
 
     /// Write a batch to the current file.
-    pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+    pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), ParquetError> {
         let writer = self.writer.as_mut().expect("Writer should be available");
 
-        writer.write(batch)?;
+        writer.write(batch).context(WriteSnafu)?;
         self.stats.records_written += batch.num_rows();
         self.stats.last_write_at = Instant::now();
         self.row_group_records += batch.num_rows();
@@ -254,7 +255,7 @@ impl ParquetWriter {
                 self.stats.records_written,
                 self.row_group_records,
             );
-            writer.flush()?;
+            writer.flush().context(WriteSnafu)?;
             self.row_group_records = 0;
             // Update bytes_written after flush
             self.stats.bytes_written = self.buffer.len();
@@ -290,10 +291,10 @@ impl ParquetWriter {
     }
 
     /// Roll the current file and start a new one.
-    fn roll_file(&mut self) -> Result<()> {
+    fn roll_file(&mut self) -> Result<(), ParquetError> {
         let start = Instant::now();
         let writer = self.writer.take().expect("Writer should be available");
-        writer.close()?;
+        writer.close().context(WriteSnafu)?;
 
         // Capture the bytes before replacing the buffer
         let bytes = std::mem::replace(
@@ -331,11 +332,11 @@ impl ParquetWriter {
 
     /// Close the current file and get all finished files.
     /// All files include their parquet bytes for uploading to storage.
-    pub fn close(mut self) -> Result<Vec<FinishedFile>> {
+    pub fn close(mut self) -> Result<Vec<FinishedFile>, ParquetError> {
         if self.stats.records_written > 0 {
             let start = Instant::now();
             let writer = self.writer.take().expect("Writer should be available");
-            writer.close()?;
+            writer.close().context(WriteSnafu)?;
 
             let bytes = self.buffer.into_inner().freeze();
 

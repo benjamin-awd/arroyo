@@ -3,11 +3,11 @@
 //! Reads gzip-compressed newline-delimited JSON files and converts them
 //! to Arrow RecordBatches using a user-provided schema.
 
-use anyhow::Result;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use arrow_json::reader::ReaderBuilder;
 use bytes::Bytes;
+use snafu::prelude::*;
 use std::io::Read;
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,6 +15,10 @@ use tracing::debug;
 
 use crate::config::CompressionFormat;
 use crate::emit;
+use crate::error::{
+    BatchFlushSnafu, DecoderBuildSnafu, GzipDecompressionSnafu, JsonDecodeSnafu, ReaderError,
+    ZstdDecompressionSnafu,
+};
 use crate::internal_events::{BytesRead, FileDecompressionCompleted};
 
 /// Configuration for the NDJSON reader.
@@ -68,7 +72,12 @@ impl NdjsonReader {
     /// * `compressed` - The compressed file data
     /// * `skip_records` - Number of records to skip from the beginning (for resuming)
     /// * `path` - File path (used for error messages and logging)
-    pub fn read(&self, compressed: Bytes, skip_records: usize, path: &str) -> Result<ReadResult> {
+    pub fn read(
+        &self,
+        compressed: Bytes,
+        skip_records: usize,
+        path: &str,
+    ) -> Result<ReadResult, ReaderError> {
         // Emit bytes read metric
         emit!(BytesRead {
             bytes: compressed.len() as u64,
@@ -80,13 +89,18 @@ impl NdjsonReader {
             CompressionFormat::Gzip => {
                 let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
                 let mut buf = Vec::new();
-                decoder.read_to_end(&mut buf).map_err(|e| {
-                    anyhow::anyhow!("Gzip decompression failed for {}: {}", path, e)
-                })?;
+                decoder
+                    .read_to_end(&mut buf)
+                    .context(GzipDecompressionSnafu {
+                        path: path.to_string(),
+                    })?;
                 buf
             }
-            CompressionFormat::Zstd => zstd::decode_all(&compressed[..])
-                .map_err(|e| anyhow::anyhow!("Zstd decompression failed for {}: {}", path, e))?,
+            CompressionFormat::Zstd => {
+                zstd::decode_all(&compressed[..]).context(ZstdDecompressionSnafu {
+                    path: path.to_string(),
+                })?
+            }
             CompressionFormat::None => compressed.to_vec(),
         };
         emit!(FileDecompressionCompleted {
@@ -105,7 +119,12 @@ impl NdjsonReader {
             .with_batch_size(self.config.batch_size)
             .with_strict_mode(false)
             .build_decoder()
-            .map_err(|e| anyhow::anyhow!("Failed to build JSON decoder: {}", e))?;
+            .map_err(|e| {
+                DecoderBuildSnafu {
+                    message: e.to_string(),
+                }
+                .build()
+            })?;
 
         // Decode and flush in interleaved fashion - decode() stops after batch_size records,
         // so we must flush after each decode to get all records
@@ -115,15 +134,22 @@ impl NdjsonReader {
         let mut records_to_skip = skip_records;
 
         loop {
-            let consumed = decoder
-                .decode(&decompressed[offset..])
-                .map_err(|e| anyhow::anyhow!("Failed to decode JSON for {}: {}", path, e))?;
+            let consumed = decoder.decode(&decompressed[offset..]).map_err(|e| {
+                JsonDecodeSnafu {
+                    path: path.to_string(),
+                    message: e.to_string(),
+                }
+                .build()
+            })?;
 
             // Flush any accumulated records after each decode
-            if let Some(batch) = decoder
-                .flush()
-                .map_err(|e| anyhow::anyhow!("Failed to flush batch for {}: {}", path, e))?
-            {
+            if let Some(batch) = decoder.flush().map_err(|e| {
+                BatchFlushSnafu {
+                    path: path.to_string(),
+                    message: e.to_string(),
+                }
+                .build()
+            })? {
                 // Apply skip logic for checkpoint recovery
                 if records_to_skip > 0 {
                     let batch_rows = batch.num_rows();

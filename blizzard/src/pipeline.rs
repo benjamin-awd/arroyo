@@ -13,9 +13,9 @@
 
 mod tasks;
 
-use anyhow::Result;
 use arrow::array::RecordBatch;
 use futures::stream::{FuturesUnordered, StreamExt};
+use snafu::prelude::*;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -25,6 +25,10 @@ use tracing::{debug, error, info, warn};
 use crate::checkpoint::CheckpointCoordinator;
 use crate::config::{CompressionFormat, Config, MB};
 use crate::emit;
+use crate::error::{
+    CheckpointSnafu, DeltaSnafu, ParquetSnafu, PipelineError, PipelineStorageSnafu, ReaderSnafu,
+    TaskJoinSnafu,
+};
 use crate::internal_events::{
     BatchesProcessed, BytesWritten, DecompressionQueueDepth, FileProcessed, FileStatus,
     PendingBatches, RecordsProcessed, RecoveredFiles,
@@ -80,14 +84,15 @@ pub struct Pipeline {
 
 impl Pipeline {
     /// Create a new pipeline from configuration.
-    pub async fn new(config: Config, shutdown: CancellationToken) -> Result<Self> {
+    pub async fn new(config: Config, shutdown: CancellationToken) -> Result<Self, PipelineError> {
         // Create storage providers
         let source_storage = Arc::new(
             StorageProvider::for_url_with_options(
                 &config.source.path,
                 config.source.storage_options.clone(),
             )
-            .await?,
+            .await
+            .context(PipelineStorageSnafu)?,
         );
 
         let sink_storage = Arc::new(
@@ -95,7 +100,8 @@ impl Pipeline {
                 &config.sink.path,
                 config.sink.storage_options.clone(),
             )
-            .await?,
+            .await
+            .context(PipelineStorageSnafu)?,
         );
 
         let checkpoint_storage = Arc::new(
@@ -103,7 +109,8 @@ impl Pipeline {
                 &config.checkpoint.path,
                 config.checkpoint.storage_options.clone(),
             )
-            .await?,
+            .await
+            .context(PipelineStorageSnafu)?,
         );
 
         let checkpoint_coordinator =
@@ -124,7 +131,7 @@ impl Pipeline {
     /// Uses a producer-consumer pattern to maximize parallelism:
     /// - **Producer**: Tokio tasks download compressed files concurrently (I/O bound)
     /// - **Consumer**: Tokio's blocking thread pool decompresses and parses files (CPU bound)
-    pub async fn run(&mut self) -> Result<PipelineStats> {
+    pub async fn run(&mut self) -> Result<PipelineStats, PipelineError> {
         info!("Starting pipeline");
 
         // Race initialization against shutdown signal
@@ -170,7 +177,7 @@ impl Pipeline {
         // Channel for downloaded files ready for CPU processing
         // Buffer size matches max_concurrent to allow downloads to stay ahead
         let (download_tx, mut download_rx) =
-            mpsc::channel::<Result<DownloadedFile>>(max_concurrent);
+            mpsc::channel::<Result<DownloadedFile, crate::error::StorageError>>(max_concurrent);
 
         // Channel for finished parquet files ready for upload
         // Larger buffer to allow more queuing and avoid blocking the writer
@@ -215,7 +222,9 @@ impl Pipeline {
         // Use FuturesUnordered to process multiple files concurrently
         let mut files_remaining = pending_files.len();
         let mut processing: FuturesUnordered<
-            std::pin::Pin<Box<dyn std::future::Future<Output = Result<ProcessedFile>> + Send>>,
+            std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<ProcessedFile, PipelineError>> + Send>,
+            >,
         > = FuturesUnordered::new();
         let mut channel_open = true;
         let mut util_timer = UtilizationTimer::new("processor");
@@ -225,12 +234,14 @@ impl Pipeline {
             let path = downloaded.path.clone();
             let path_for_result = path.clone();
             let task: std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<ProcessedFile>> + Send>,
+                Box<dyn std::future::Future<Output = Result<ProcessedFile, PipelineError>> + Send>,
             > = Box::pin(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     reader.read(downloaded.compressed_data, downloaded.skip_records, &path)
                 })
-                .await??;
+                .await
+                .context(TaskJoinSnafu)?
+                .context(ReaderSnafu)?;
                 Ok(ProcessedFile {
                     path: path_for_result,
                     batches: result.batches,
@@ -249,7 +260,10 @@ impl Pipeline {
 
             if self.shutdown.is_cancelled() {
                 info!("Shutdown requested, stopping processing");
-                self.checkpoint_coordinator.checkpoint().await?;
+                self.checkpoint_coordinator
+                    .checkpoint()
+                    .await
+                    .context(CheckpointSnafu)?;
                 break;
             }
 
@@ -289,8 +303,11 @@ impl Pipeline {
                             } else {
                                 error!("Error downloading file: {}", e);
                                 emit!(FileProcessed { status: FileStatus::Failed });
-                                self.checkpoint_coordinator.checkpoint().await?;
-                                return Err(e);
+                                self.checkpoint_coordinator
+                                    .checkpoint()
+                                    .await
+                                    .context(CheckpointSnafu)?;
+                                return Err(e).context(PipelineStorageSnafu);
                             }
                         }
                         None => {
@@ -317,7 +334,7 @@ impl Pipeline {
                                 // Write all batches from this file
                                 for batch in &processed.batches {
                                     debug!("[batch] {}: {} rows", short_name, batch.num_rows());
-                                    writer.write_batch(batch)?;
+                                    writer.write_batch(batch).context(ParquetSnafu)?;
                                     self.stats.records_processed += batch.num_rows();
                                     emit!(RecordsProcessed { count: batch.num_rows() as u64 });
                                     emit!(BatchesProcessed { count: 1 });
@@ -361,7 +378,10 @@ impl Pipeline {
                                 } else {
                                     error!("Error processing file: {}", e);
                                     emit!(FileProcessed { status: FileStatus::Failed });
-                                    self.checkpoint_coordinator.checkpoint().await?;
+                                    self.checkpoint_coordinator
+                                        .checkpoint()
+                                        .await
+                                        .context(CheckpointSnafu)?;
                                     return Err(e);
                                 }
                             }
@@ -372,7 +392,10 @@ impl Pipeline {
 
             // Check if we should checkpoint
             if self.checkpoint_coordinator.should_checkpoint().await {
-                self.checkpoint_coordinator.checkpoint().await?;
+                self.checkpoint_coordinator
+                    .checkpoint()
+                    .await
+                    .context(CheckpointSnafu)?;
                 self.stats.checkpoints_saved += 1;
             }
         }
@@ -385,7 +408,7 @@ impl Pipeline {
 
         // Send remaining parquet files to uploader
         info!("Final flush - closing writer");
-        let finished_files = writer.close()?;
+        let finished_files = writer.close().context(ParquetSnafu)?;
         for file in finished_files {
             self.stats.parquet_files_written += 1;
             self.stats.bytes_written += file.size;
@@ -400,7 +423,8 @@ impl Pipeline {
         // Close upload channel and wait for uploader to finish
         drop(upload_tx);
         info!("Waiting for uploads to complete...");
-        let (delta_sink, files_uploaded, bytes_uploaded) = upload_handle.await?;
+        let (delta_sink, files_uploaded, bytes_uploaded) =
+            upload_handle.await.context(TaskJoinSnafu)?;
         info!(
             "All uploads complete: {} files, {} bytes",
             files_uploaded, bytes_uploaded
@@ -408,7 +432,10 @@ impl Pipeline {
         self.stats.delta_commits = files_uploaded;
 
         // Save final checkpoint
-        self.checkpoint_coordinator.checkpoint().await?;
+        self.checkpoint_coordinator
+            .checkpoint()
+            .await
+            .context(CheckpointSnafu)?;
         self.stats.checkpoints_saved += 1;
 
         info!("Pipeline completed: {:?}", self.stats);
@@ -424,9 +451,13 @@ impl Pipeline {
     ///
     /// This method is designed to be cancellation-safe - it can be dropped at any
     /// `.await` point without leaving the system in an inconsistent state.
-    async fn prepare_pipeline(&mut self) -> Result<Option<InitializedState>> {
+    async fn prepare_pipeline(&mut self) -> Result<Option<InitializedState>, PipelineError> {
         // Restore from checkpoint
-        let checkpoint = self.checkpoint_coordinator.restore().await?;
+        let checkpoint = self
+            .checkpoint_coordinator
+            .restore()
+            .await
+            .context(CheckpointSnafu)?;
         if let Some(ref cp) = checkpoint {
             info!(
                 "Restored from checkpoint, delta version: {}, pending files: {}",
@@ -439,14 +470,20 @@ impl Pipeline {
         let schema = self.config.to_arrow_schema();
 
         // Create Delta sink
-        let mut delta_sink = DeltaSink::new(self.sink_storage.clone(), &schema).await?;
+        let mut delta_sink = DeltaSink::new(self.sink_storage.clone(), &schema)
+            .await
+            .context(DeltaSnafu)?;
 
         // Handle pending files from checkpoint
         if let Some(ref cp) = checkpoint {
             if !cp.pending_files.is_empty() {
                 let pending_count = cp.pending_files.len();
                 info!("Committing {} pending files from checkpoint", pending_count);
-                if let Some(version) = delta_sink.recover_pending_files(&cp.pending_files).await? {
+                if let Some(version) = delta_sink
+                    .recover_pending_files(&cp.pending_files)
+                    .await
+                    .context(DeltaSnafu)?
+                {
                     self.checkpoint_coordinator
                         .update_delta_version(version)
                         .await;
@@ -524,13 +561,15 @@ impl Pipeline {
     }
 
     /// List source NDJSON files.
-    async fn list_source_files(&self) -> Result<Vec<String>> {
-        list_ndjson_files(&self.source_storage).await
+    async fn list_source_files(&self) -> Result<Vec<String>, PipelineError> {
+        list_ndjson_files(&self.source_storage)
+            .await
+            .context(PipelineStorageSnafu)
     }
 }
 
 /// Run the pipeline with the given configuration.
-pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
+pub async fn run_pipeline(config: Config) -> Result<PipelineStats, PipelineError> {
     let shutdown = CancellationToken::new();
 
     // Set up signal handler for graceful shutdown

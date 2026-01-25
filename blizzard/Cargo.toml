@@ -13,7 +13,7 @@ license = "MIT OR Apache-2.0"
 # Arrow ecosystem
 arrow = { version = "55", default-features = false, features = ["chrono-tz"] }
 arrow-json = { version = "55", default-features = false }
-parquet = { version = "55", default-features = false, features = ["arrow", "async", "snap"] }
+parquet = { version = "55", default-features = false, features = ["arrow", "async", "snap", "zstd", "lz4"] }
 
 # Delta Lake
 deltalake = { version = "0.30", default-features = false, features = ["s3", "gcs"] }

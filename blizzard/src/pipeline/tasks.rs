@@ -3,7 +3,6 @@
 //! These tasks are spawned by the main pipeline to handle I/O-bound work
 //! concurrently while the main loop processes files.
 
-use anyhow::Result;
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::future::Future;
@@ -15,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::emit;
+use crate::error::StorageError;
 use crate::internal_events::{
     ActiveDownloads, ActiveUploads, FileDownloadCompleted, RecoveredRecords,
 };
@@ -53,7 +53,7 @@ async fn upload_file(
     part_size: usize,
     min_multipart_size: usize,
     max_concurrent_parts: usize,
-) -> Result<UploadResult> {
+) -> Result<UploadResult, StorageError> {
     let Some(bytes) = file.bytes else {
         // No bytes means the file was already uploaded (e.g., from checkpoint recovery)
         return Ok(UploadResult {
@@ -89,8 +89,9 @@ pub(super) async fn run_uploader(
     shutdown: CancellationToken,
     config: UploaderConfig,
 ) -> (DeltaSink, usize, usize) {
-    let mut uploads: FuturesUnordered<Pin<Box<dyn Future<Output = Result<UploadResult>> + Send>>> =
-        FuturesUnordered::new();
+    let mut uploads: FuturesUnordered<
+        Pin<Box<dyn Future<Output = Result<UploadResult, StorageError>> + Send>>,
+    > = FuturesUnordered::new();
 
     let mut active_uploads = 0;
     let max_concurrent_uploads = config.max_concurrent_uploads;
@@ -257,12 +258,12 @@ pub(super) async fn run_downloader(
     pending_files: Vec<String>,
     source_state: SourceState,
     storage: StorageProviderRef,
-    download_tx: mpsc::Sender<Result<DownloadedFile>>,
+    download_tx: mpsc::Sender<Result<DownloadedFile, StorageError>>,
     shutdown: CancellationToken,
     max_concurrent: usize,
 ) {
     let mut downloads: FuturesUnordered<
-        Pin<Box<dyn Future<Output = Result<DownloadedFile>> + Send>>,
+        Pin<Box<dyn Future<Output = Result<DownloadedFile, StorageError>> + Send>>,
     > = FuturesUnordered::new();
 
     let mut pending_iter = pending_files.into_iter();
@@ -373,7 +374,7 @@ async fn download_file(
     storage: StorageProviderRef,
     path: String,
     skip_records: usize,
-) -> Result<DownloadedFile> {
+) -> Result<DownloadedFile, StorageError> {
     let start = Instant::now();
     let compressed_data = storage.get(path.as_str()).await?;
     emit!(FileDownloadCompleted {

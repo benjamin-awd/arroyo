@@ -3,12 +3,14 @@
 //! This module provides metrics collection and exposure via HTTP.
 //! It also provides health endpoints for Kubernetes liveness/readiness probes.
 
-use anyhow::Result;
 use axum::{Extension, Router, routing::get};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use snafu::prelude::*;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tracing::error;
+
+use crate::error::{MetricsError, PrometheusInitSnafu};
 
 /// Initialize the Prometheus metrics exporter with an HTTP endpoint.
 ///
@@ -29,8 +31,10 @@ use tracing::error;
 /// let addr: SocketAddr = "0.0.0.0:9090".parse().unwrap();
 /// metrics::init(addr).expect("Failed to initialize metrics");
 /// ```
-pub fn init(addr: SocketAddr) -> Result<()> {
-    let handle = PrometheusBuilder::new().install_recorder()?;
+pub fn init(addr: SocketAddr) -> Result<(), MetricsError> {
+    let handle = PrometheusBuilder::new()
+        .install_recorder()
+        .context(PrometheusInitSnafu)?;
 
     // Spawn the HTTP server in the background
     tokio::spawn(run_server(addr, handle));

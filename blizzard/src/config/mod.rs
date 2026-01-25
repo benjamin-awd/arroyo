@@ -4,12 +4,17 @@
 //! and converts user-defined schemas to Arrow schemas.
 
 mod vars;
-use anyhow::{Result, bail};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use serde::{Deserialize, Serialize};
+use snafu::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+
+use crate::error::{
+    ConfigError, EmptyCheckpointPathSnafu, EmptySchemaSnafu, EmptySinkPathSnafu,
+    EmptySourcePathSnafu, EnvInterpolationSnafu, ReadFileSnafu, YamlParseSnafu,
+};
 
 /// Byte size constants (binary/IEC units).
 pub const KB: usize = 1024;
@@ -250,44 +255,39 @@ pub enum ParquetCompression {
 
 impl Config {
     /// Load configuration from a YAML file.
-    pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         Self::from_file_with_options(path, true)
     }
 
     /// Load configuration from a YAML file with optional environment variable interpolation.
-    pub fn from_file_with_options(path: impl AsRef<Path>, interpolate_env: bool) -> Result<Self> {
-        let content = std::fs::read_to_string(path.as_ref())?;
+    pub fn from_file_with_options(
+        path: impl AsRef<Path>,
+        interpolate_env: bool,
+    ) -> Result<Self, ConfigError> {
+        let content = std::fs::read_to_string(path.as_ref()).context(ReadFileSnafu)?;
 
         let content = if interpolate_env {
             let result = vars::interpolate(&content);
             if !result.is_ok() {
                 let error_msg = result.errors.join("\n");
-                bail!("Environment variable interpolation failed:\n{}", error_msg);
+                return EnvInterpolationSnafu { message: error_msg }.fail();
             }
             result.text
         } else {
             content
         };
 
-        let config: Config = serde_yaml::from_str(&content)?;
+        let config: Config = serde_yaml::from_str(&content).context(YamlParseSnafu)?;
         config.validate()?;
         Ok(config)
     }
 
     /// Validate the configuration.
-    fn validate(&self) -> Result<()> {
-        if self.source.path.is_empty() {
-            bail!("Source path cannot be empty");
-        }
-        if self.sink.path.is_empty() {
-            bail!("Sink path cannot be empty");
-        }
-        if self.checkpoint.path.is_empty() {
-            bail!("Checkpoint path cannot be empty");
-        }
-        if self.schema.fields.is_empty() {
-            bail!("Schema must have at least one field");
-        }
+    fn validate(&self) -> Result<(), ConfigError> {
+        ensure!(!self.source.path.is_empty(), EmptySourcePathSnafu);
+        ensure!(!self.sink.path.is_empty(), EmptySinkPathSnafu);
+        ensure!(!self.checkpoint.path.is_empty(), EmptyCheckpointPathSnafu);
+        ensure!(!self.schema.fields.is_empty(), EmptySchemaSnafu);
         Ok(())
     }
 

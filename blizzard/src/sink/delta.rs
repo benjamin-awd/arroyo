@@ -3,13 +3,13 @@
 //! Handles creating/opening Delta Lake tables and committing
 //! Parquet files with exactly-once semantics.
 
-use anyhow::Result;
 use arrow::datatypes::Schema;
 use deltalake::DeltaTable;
 use deltalake::kernel::Action;
 use deltalake::operations::create::CreateBuilder;
 use deltalake::protocol::SaveMode;
 use object_store::path::Path;
+use snafu::prelude::*;
 use std::collections::HashSet;
 use std::time::Instant;
 use tracing::{debug, info};
@@ -18,6 +18,9 @@ use url::Url;
 use super::FinishedFile;
 use crate::checkpoint::PendingFile;
 use crate::emit;
+use crate::error::{
+    DeltaError, DeltaLakeSnafu, StructTypeSnafu, UnsupportedArrowTypeSnafu, UrlParseSnafu,
+};
 use crate::internal_events::DeltaCommitCompleted;
 use crate::storage::{BackendConfig, StorageProvider, StorageProviderRef};
 
@@ -29,7 +32,7 @@ pub struct DeltaSink {
 
 impl DeltaSink {
     /// Load or create a Delta Lake table.
-    pub async fn new(storage: StorageProviderRef, schema: &Schema) -> Result<Self> {
+    pub async fn new(storage: StorageProviderRef, schema: &Schema) -> Result<Self, DeltaError> {
         // Register Delta Lake handlers for cloud storage
         deltalake::aws::register_handlers(None);
         deltalake::gcp::register_handlers(None);
@@ -46,7 +49,10 @@ impl DeltaSink {
     /// Commit a set of finished files to the Delta Lake table.
     ///
     /// Returns the new version number if a commit was made.
-    pub async fn commit_files(&mut self, files: &[FinishedFile]) -> Result<Option<i64>> {
+    pub async fn commit_files(
+        &mut self,
+        files: &[FinishedFile],
+    ) -> Result<Option<i64>, DeltaError> {
         if files.is_empty() {
             return Ok(None);
         }
@@ -74,7 +80,10 @@ impl DeltaSink {
     ///
     /// These files were uploaded but not committed (e.g., crash after upload).
     /// Returns new version if files were committed.
-    pub async fn recover_pending_files(&mut self, pending: &[PendingFile]) -> Result<Option<i64>> {
+    pub async fn recover_pending_files(
+        &mut self,
+        pending: &[PendingFile],
+    ) -> Result<Option<i64>, DeltaError> {
         if pending.is_empty() {
             return Ok(None);
         }
@@ -94,7 +103,7 @@ impl DeltaSink {
 }
 
 /// Convert an Arrow schema to a Delta schema.
-fn arrow_schema_to_delta(schema: &Schema) -> Result<deltalake::kernel::StructType> {
+fn arrow_schema_to_delta(schema: &Schema) -> Result<deltalake::kernel::StructType, DeltaError> {
     use deltalake::kernel::{StructField, StructType};
 
     let fields: Vec<StructField> = schema
@@ -108,15 +117,20 @@ fn arrow_schema_to_delta(schema: &Schema) -> Result<deltalake::kernel::StructTyp
                 field.is_nullable(),
             ))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>, DeltaError>>()?;
 
-    StructType::try_new(fields).map_err(|e| anyhow::anyhow!("Failed to create struct type: {}", e))
+    StructType::try_new(fields).map_err(|e| {
+        StructTypeSnafu {
+            message: e.to_string(),
+        }
+        .build()
+    })
 }
 
 /// Convert an Arrow data type to a Delta data type.
 fn arrow_type_to_delta(
     arrow_type: &arrow::datatypes::DataType,
-) -> Result<deltalake::kernel::DataType> {
+) -> Result<deltalake::kernel::DataType, DeltaError> {
     use arrow::datatypes::DataType as ArrowType;
     use deltalake::kernel::DataType as DeltaType;
 
@@ -132,10 +146,25 @@ fn arrow_type_to_delta(
         ArrowType::Binary | ArrowType::LargeBinary => DeltaType::BINARY,
         ArrowType::Date32 | ArrowType::Date64 => DeltaType::DATE,
         ArrowType::Timestamp(_, _) => DeltaType::TIMESTAMP,
-        ArrowType::Decimal128(precision, scale) => DeltaType::decimal(*precision, *scale as u8)?,
-        ArrowType::Decimal256(precision, scale) => DeltaType::decimal(*precision, *scale as u8)?,
+        ArrowType::Decimal128(precision, scale) => DeltaType::decimal(*precision, *scale as u8)
+            .map_err(|e| {
+                crate::error::DecimalPrecisionSnafu {
+                    message: e.to_string(),
+                }
+                .build()
+            })?,
+        ArrowType::Decimal256(precision, scale) => DeltaType::decimal(*precision, *scale as u8)
+            .map_err(|e| {
+                crate::error::DecimalPrecisionSnafu {
+                    message: e.to_string(),
+                }
+                .build()
+            })?,
         other => {
-            return Err(anyhow::anyhow!("Unsupported Arrow type: {:?}", other));
+            return UnsupportedArrowTypeSnafu {
+                arrow_type: other.clone(),
+            }
+            .fail();
         }
     };
 
@@ -146,7 +175,7 @@ fn arrow_type_to_delta(
 pub async fn load_or_create_table(
     storage_provider: &StorageProvider,
     schema: &Schema,
-) -> Result<DeltaTable> {
+) -> Result<DeltaTable, DeltaError> {
     let empty_path = &Path::parse("").unwrap();
 
     let table_url: String = match storage_provider.config() {
@@ -177,7 +206,7 @@ pub async fn load_or_create_table(
     };
 
     // Try to open existing table
-    let parsed_url = Url::parse(&table_url)?;
+    let parsed_url = Url::parse(&table_url).context(UrlParseSnafu)?;
     match deltalake::open_table_with_storage_options(
         parsed_url.clone(),
         storage_provider.storage_options().clone(),
@@ -202,7 +231,8 @@ pub async fn load_or_create_table(
                 .with_location(&table_url)
                 .with_columns(delta_schema.fields().cloned())
                 .with_storage_options(storage_provider.storage_options().clone())
-                .await?;
+                .await
+                .context(DeltaLakeSnafu)?;
 
             Ok(table)
         }
@@ -220,7 +250,7 @@ async fn check_existing_files(
     table: &DeltaTable,
     last_version: i64,
     finished_files: &[FinishedFile],
-) -> Result<Option<i64>> {
+) -> Result<Option<i64>, DeltaError> {
     let current_version = table.version().unwrap_or_default();
 
     // If table version hasn't changed since our last commit, files can't be duplicates
@@ -239,7 +269,11 @@ async fn check_existing_files(
         .collect();
 
     // Check current table files for duplicates
-    let existing_files: HashSet<String> = table.get_file_uris()?.map(|p| p.to_string()).collect();
+    let existing_files: HashSet<String> = table
+        .get_file_uris()
+        .context(DeltaLakeSnafu)?
+        .map(|p| p.to_string())
+        .collect();
 
     for file in &files {
         if existing_files.contains(file) {
@@ -259,7 +293,7 @@ pub async fn commit_files_to_delta(
     finished_files: &[FinishedFile],
     table: &mut DeltaTable,
     last_version: i64,
-) -> Result<Option<i64>> {
+) -> Result<Option<i64>, DeltaError> {
     if finished_files.is_empty() {
         return Ok(None);
     }
@@ -307,14 +341,17 @@ fn create_add_action(file: &FinishedFile) -> Action {
 }
 
 /// Commit add actions to the Delta table.
-async fn commit_to_delta(table: &mut DeltaTable, add_actions: Vec<Action>) -> Result<i64> {
+async fn commit_to_delta(
+    table: &mut DeltaTable,
+    add_actions: Vec<Action>,
+) -> Result<i64, DeltaError> {
     use deltalake::kernel::transaction::CommitBuilder;
 
     let start = Instant::now();
     let version = CommitBuilder::default()
         .with_actions(add_actions)
         .build(
-            Some(table.snapshot()?),
+            Some(table.snapshot().context(DeltaLakeSnafu)?),
             table.log_store(),
             deltalake::protocol::DeltaOperation::Write {
                 mode: SaveMode::Append,
@@ -322,11 +359,12 @@ async fn commit_to_delta(table: &mut DeltaTable, add_actions: Vec<Action>) -> Re
                 predicate: None,
             },
         )
-        .await?
+        .await
+        .context(DeltaLakeSnafu)?
         .version;
 
     // Reload table to get new state
-    table.load().await?;
+    table.load().await.context(DeltaLakeSnafu)?;
 
     emit!(DeltaCommitCompleted {
         duration: start.elapsed()

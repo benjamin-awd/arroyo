@@ -3,7 +3,6 @@
 //! Provides a unified interface for working with S3, GCS, Azure Blob Storage,
 //! and local filesystem.
 
-use anyhow::{Result, bail};
 use bytes::Bytes;
 use futures::{Stream, StreamExt, TryStreamExt, future::ready};
 use object_store::aws::AmazonS3Builder;
@@ -14,6 +13,7 @@ use object_store::multipart::{MultipartStore, PartId};
 use object_store::path::Path;
 use object_store::{ObjectStore, PutPayload, RetryConfig};
 use regex::Regex;
+use snafu::prelude::*;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -22,6 +22,10 @@ use std::time::Instant;
 use tracing::debug;
 
 use crate::emit;
+use crate::error::{
+    AzureConfigSnafu, GcsConfigSnafu, InvalidUrlSnafu, IoSnafu, ObjectStoreSnafu, S3ConfigSnafu,
+    StorageError,
+};
 use crate::internal_events::{
     ActiveMultipartParts, MultipartUploadCompleted, RequestStatus, StorageOperation,
     StorageRequest, StorageRequestDuration,
@@ -164,7 +168,7 @@ pub enum BackendConfig {
 
 impl BackendConfig {
     /// Parse a URL into a backend configuration.
-    pub fn parse_url(url: &str, with_key: bool) -> Result<Self> {
+    pub fn parse_url(url: &str, with_key: bool) -> Result<Self, StorageError> {
         for (k, v) in matchers() {
             if let Some(matches) = v.iter().filter_map(|r| r.captures(url)).next() {
                 return match k {
@@ -176,10 +180,13 @@ impl BackendConfig {
             }
         }
 
-        bail!("Invalid storage URL: {url}")
+        InvalidUrlSnafu {
+            url: url.to_string(),
+        }
+        .fail()
     }
 
-    fn parse_s3(matches: regex::Captures) -> Result<Self> {
+    fn parse_s3(matches: regex::Captures) -> Result<Self, StorageError> {
         let bucket = matches
             .name("bucket")
             .expect("bucket should always be available")
@@ -214,7 +221,7 @@ impl BackendConfig {
         }))
     }
 
-    fn parse_gcs(matches: regex::Captures) -> Result<Self> {
+    fn parse_gcs(matches: regex::Captures) -> Result<Self, StorageError> {
         let bucket = matches
             .name("bucket")
             .expect("bucket should always be available")
@@ -226,7 +233,7 @@ impl BackendConfig {
         Ok(BackendConfig::Gcs(GcsConfig { bucket, key }))
     }
 
-    fn parse_azure(matches: regex::Captures) -> Result<Self> {
+    fn parse_azure(matches: regex::Captures) -> Result<Self, StorageError> {
         let container = matches
             .name("container")
             .expect("container should always be available")
@@ -248,7 +255,7 @@ impl BackendConfig {
         }))
     }
 
-    fn parse_local(matches: regex::Captures, with_key: bool) -> Result<Self> {
+    fn parse_local(matches: regex::Captures, with_key: bool) -> Result<Self, StorageError> {
         let path = matches
             .name("path")
             .expect("path regex must contain a path group")
@@ -288,7 +295,10 @@ impl BackendConfig {
 
 impl StorageProvider {
     /// Create a storage provider for the given URL with storage options.
-    pub async fn for_url_with_options(url: &str, options: HashMap<String, String>) -> Result<Self> {
+    pub async fn for_url_with_options(
+        url: &str,
+        options: HashMap<String, String>,
+    ) -> Result<Self, StorageError> {
         let config = BackendConfig::parse_url(url, false)?;
 
         match config {
@@ -299,11 +309,14 @@ impl StorageProvider {
         }
     }
 
-    async fn construct_s3(config: S3Config, options: HashMap<String, String>) -> Result<Self> {
+    async fn construct_s3(
+        config: S3Config,
+        options: HashMap<String, String>,
+    ) -> Result<Self, StorageError> {
         let mut builder = AmazonS3Builder::from_env().with_bucket_name(&config.bucket);
 
         for (key, value) in &options {
-            builder = builder.with_config(key.parse()?, value.clone());
+            builder = builder.with_config(key.parse().context(S3ConfigSnafu)?, value.clone());
         }
 
         // Disable retries; we handle our own
@@ -336,7 +349,7 @@ impl StorageProvider {
             canonical_url
         };
 
-        let s3_store = Arc::new(builder.build()?);
+        let s3_store = Arc::new(builder.build().context(S3ConfigSnafu)?);
         // S3 supports MultipartStore for parallel part uploads
         let multipart_store: Option<Arc<dyn MultipartStore>> = Some(s3_store.clone());
         let object_store: Arc<dyn ObjectStore> = s3_store;
@@ -350,7 +363,7 @@ impl StorageProvider {
         })
     }
 
-    async fn construct_gcs(config: GcsConfig) -> Result<Self> {
+    async fn construct_gcs(config: GcsConfig) -> Result<Self, StorageError> {
         let mut builder = GoogleCloudStorageBuilder::from_env().with_bucket_name(&config.bucket);
 
         let retry_config = RetryConfig {
@@ -369,7 +382,7 @@ impl StorageProvider {
             canonical_url = format!("{}/{}", canonical_url, key);
         }
 
-        let gcs_store = Arc::new(builder.build()?);
+        let gcs_store = Arc::new(builder.build().context(GcsConfigSnafu)?);
         // GCS supports MultipartStore for parallel part uploads
         let multipart_store: Option<Arc<dyn MultipartStore>> = Some(gcs_store.clone());
         let object_store: Arc<dyn ObjectStore> = gcs_store;
@@ -383,7 +396,7 @@ impl StorageProvider {
         })
     }
 
-    async fn construct_azure(config: AzureConfig) -> Result<Self> {
+    async fn construct_azure(config: AzureConfig) -> Result<Self, StorageError> {
         let builder = MicrosoftAzureBuilder::from_env().with_container_name(&config.container);
 
         let canonical_url = format!(
@@ -391,7 +404,7 @@ impl StorageProvider {
             config.account, config.container
         );
 
-        let azure_store = Arc::new(builder.build()?);
+        let azure_store = Arc::new(builder.build().context(AzureConfigSnafu)?);
         // Azure supports MultipartStore for parallel part uploads
         let multipart_store: Option<Arc<dyn MultipartStore>> = Some(azure_store.clone());
         let object_store: Arc<dyn ObjectStore> = azure_store;
@@ -405,11 +418,13 @@ impl StorageProvider {
         })
     }
 
-    async fn construct_local(config: LocalConfig) -> Result<Self> {
-        tokio::fs::create_dir_all(&config.path).await?;
+    async fn construct_local(config: LocalConfig) -> Result<Self, StorageError> {
+        tokio::fs::create_dir_all(&config.path)
+            .await
+            .context(IoSnafu)?;
 
         let object_store: Arc<dyn ObjectStore> =
-            Arc::new(LocalFileSystem::new_with_prefix(&config.path)?);
+            Arc::new(LocalFileSystem::new_with_prefix(&config.path).context(ObjectStoreSnafu)?);
 
         let canonical_url = format!("file://{}", config.path);
 
@@ -428,7 +443,7 @@ impl StorageProvider {
     pub async fn list(
         &self,
         include_subdirectories: bool,
-    ) -> Result<impl Stream<Item = Result<Path, object_store::Error>> + '_> {
+    ) -> Result<impl Stream<Item = Result<Path, object_store::Error>> + '_, StorageError> {
         // Emit metric for list operation initiation
         emit!(StorageRequest {
             operation: StorageOperation::List,
@@ -466,7 +481,7 @@ impl StorageProvider {
     }
 
     /// Get the contents of a file.
-    pub async fn get(&self, path: impl Into<Path>) -> Result<Bytes> {
+    pub async fn get(&self, path: impl Into<Path>) -> Result<Bytes, StorageError> {
         let path = path.into();
         let start = Instant::now();
         let result = self.object_store.get(&self.qualify_path(&path)).await;
@@ -485,12 +500,19 @@ impl StorageProvider {
             duration: start.elapsed(),
         });
 
-        let bytes = result?.bytes().await?;
+        let bytes = result
+            .context(ObjectStoreSnafu)?
+            .bytes()
+            .await
+            .context(ObjectStoreSnafu)?;
         Ok(bytes)
     }
 
     /// Get file contents if present, returning None if not found.
-    pub async fn get_if_present(&self, path: impl Into<Path>) -> Result<Option<Bytes>> {
+    pub async fn get_if_present(
+        &self,
+        path: impl Into<Path>,
+    ) -> Result<Option<Bytes>, StorageError> {
         let path: Path = path.into();
         let start = Instant::now();
         let result = self.object_store.get(&self.qualify_path(&path)).await;
@@ -511,16 +533,16 @@ impl StorageProvider {
 
         match result {
             Ok(obj) => {
-                let bytes = obj.bytes().await?;
+                let bytes = obj.bytes().await.context(ObjectStoreSnafu)?;
                 Ok(Some(bytes))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(err) => Err(err.into()),
+            Err(err) => Err(err).context(ObjectStoreSnafu),
         }
     }
 
     /// Check if a file exists.
-    pub async fn exists<P: Into<Path>>(&self, path: P) -> Result<bool> {
+    pub async fn exists<P: Into<Path>>(&self, path: P) -> Result<bool, StorageError> {
         let path: Path = path.into();
         let start = Instant::now();
         let result = self.object_store.head(&self.qualify_path(&path)).await;
@@ -542,12 +564,12 @@ impl StorageProvider {
         match result {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e).context(ObjectStoreSnafu),
         }
     }
 
     /// Put bytes to a path.
-    pub async fn put(&self, path: impl Into<Path>, bytes: Vec<u8>) -> Result<()> {
+    pub async fn put(&self, path: impl Into<Path>, bytes: Vec<u8>) -> Result<(), StorageError> {
         let bytes = PutPayload::from(Bytes::from(bytes));
         let path = path.into();
         let path = self.qualify_path(&path);
@@ -568,7 +590,7 @@ impl StorageProvider {
             duration: start.elapsed(),
         });
 
-        result?;
+        result.context(ObjectStoreSnafu)?;
         Ok(())
     }
 
@@ -591,7 +613,7 @@ impl StorageProvider {
     }
 
     /// Put a payload to a path.
-    pub async fn put_payload(&self, path: &Path, payload: PutPayload) -> Result<()> {
+    pub async fn put_payload(&self, path: &Path, payload: PutPayload) -> Result<(), StorageError> {
         let path = self.qualify_path(path);
         let start = Instant::now();
         let result = self.object_store.put(&path, payload).await;
@@ -610,7 +632,7 @@ impl StorageProvider {
             duration: start.elapsed(),
         });
 
-        result?;
+        result.context(ObjectStoreSnafu)?;
         Ok(())
     }
 
@@ -628,7 +650,7 @@ impl StorageProvider {
         part_size: usize,
         min_multipart_size: usize,
         max_concurrent_parts: usize,
-    ) -> Result<()> {
+    ) -> Result<(), StorageError> {
         // Small files use simple PUT
         if bytes.len() < min_multipart_size || self.multipart_store.is_none() {
             return self.put_payload(path, PutPayload::from(bytes)).await;
@@ -652,7 +674,7 @@ impl StorageProvider {
             operation: StorageOperation::CreateMultipart,
             duration: create_start.elapsed(),
         });
-        let multipart_id = create_result?;
+        let multipart_id = create_result.context(ObjectStoreSnafu)?;
 
         // Create parts with indices
         let parts: Vec<(usize, Bytes)> = (0..)
@@ -709,9 +731,9 @@ impl StorageProvider {
                     let count = active_parts.fetch_sub(1, Ordering::Relaxed) - 1;
                     emit!(ActiveMultipartParts { count });
 
-                    let part_id = result?;
+                    let part_id = result.context(ObjectStoreSnafu)?;
                     debug!("Uploaded part {}/{}", idx + 1, total_parts);
-                    Ok::<_, anyhow::Error>((idx, part_id))
+                    Ok::<_, StorageError>((idx, part_id))
                 }
             })
             .buffer_unordered(max_concurrent_parts)
@@ -745,7 +767,7 @@ impl StorageProvider {
             duration: complete_start.elapsed(),
         });
 
-        complete_result?;
+        complete_result.context(ObjectStoreSnafu)?;
         emit!(MultipartUploadCompleted);
         debug!("Completed parallel multipart upload for {}", path);
 
@@ -754,13 +776,13 @@ impl StorageProvider {
 }
 
 /// List NDJSON.gz files recursively.
-pub async fn list_ndjson_files(storage: &StorageProvider) -> Result<Vec<String>> {
+pub async fn list_ndjson_files(storage: &StorageProvider) -> Result<Vec<String>, StorageError> {
     let mut files = Vec::new();
     let mut stream = storage.list(true).await?;
     let mut total_listed = 0;
 
     while let Some(result) = stream.next().await {
-        let path = result?;
+        let path = result.context(ObjectStoreSnafu)?;
         let path_str = path.to_string();
         total_listed += 1;
 

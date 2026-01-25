@@ -7,10 +7,10 @@
 //! # Example
 //!
 //! ```ignore
-//! use blizzard::{Config, run_pipeline};
+//! use blizzard::{Config, run_pipeline, error::PipelineError};
 //!
 //! #[tokio::main]
-//! async fn main() -> anyhow::Result<()> {
+//! async fn main() -> Result<(), PipelineError> {
 //!     let config = Config::from_file("config.yaml")?;
 //!     let stats = run_pipeline(config).await?;
 //!     println!("Processed {} records", stats.records_processed);
@@ -20,6 +20,7 @@
 
 pub mod checkpoint;
 pub mod config;
+pub mod error;
 pub mod internal_events;
 pub mod metrics;
 pub mod pipeline;

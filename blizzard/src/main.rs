@@ -6,6 +6,7 @@
 
 mod checkpoint;
 mod config;
+mod error;
 mod internal_events;
 mod metrics;
 mod pipeline;
@@ -14,13 +15,14 @@ mod source;
 mod storage;
 mod utilization;
 
-use anyhow::Result;
 use clap::Parser;
+use snafu::prelude::*;
 use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use config::Config;
+use error::{AddressParseSnafu, ConfigSnafu, MetricsSnafu, PipelineError};
 use pipeline::run_pipeline;
 
 /// NDJSON.gz to Delta Lake streaming tool.
@@ -41,8 +43,9 @@ struct Args {
     dry_run: bool,
 }
 
+#[snafu::report]
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), PipelineError> {
     let args = Args::parse();
 
     // Initialize logging
@@ -61,8 +64,8 @@ async fn main() -> Result<()> {
 
     // Initialize metrics if enabled
     if config.metrics.enabled {
-        let addr = config.metrics.address.parse()?;
-        metrics::init(addr)?;
+        let addr = config.metrics.address.parse().context(AddressParseSnafu)?;
+        metrics::init(addr).context(MetricsSnafu)?;
         info!(
             "Metrics endpoint listening on http://{}/metrics",
             config.metrics.address
@@ -97,6 +100,6 @@ async fn main() -> Result<()> {
 }
 
 /// Build configuration from arguments.
-fn build_config(args: &Args) -> Result<Config> {
-    Config::from_file(&args.config)
+fn build_config(args: &Args) -> Result<Config, PipelineError> {
+    Config::from_file(&args.config).context(ConfigSnafu)
 }
