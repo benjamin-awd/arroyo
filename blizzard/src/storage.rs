@@ -18,10 +18,14 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use tracing::debug;
 
 use crate::emit;
-use crate::internal_events::ActiveMultipartParts;
+use crate::internal_events::{
+    ActiveMultipartParts, MultipartUploadCompleted, RequestStatus, StorageOperation,
+    StorageRequest, StorageRequestDuration,
+};
 
 /// A reference-counted storage provider.
 pub type StorageProviderRef = Arc<StorageProvider>;
@@ -425,6 +429,12 @@ impl StorageProvider {
         &self,
         include_subdirectories: bool,
     ) -> Result<impl Stream<Item = Result<Path, object_store::Error>> + '_> {
+        // Emit metric for list operation initiation
+        emit!(StorageRequest {
+            operation: StorageOperation::List,
+            status: RequestStatus::Success,
+        });
+
         let key_path: Option<Path> = self.config.key().map(|key| key.to_string().into());
         let key_part_count = key_path
             .as_ref()
@@ -458,20 +468,48 @@ impl StorageProvider {
     /// Get the contents of a file.
     pub async fn get(&self, path: impl Into<Path>) -> Result<Bytes> {
         let path = path.into();
-        let bytes = self
-            .object_store
-            .get(&self.qualify_path(&path))
-            .await?
-            .bytes()
-            .await?;
+        let start = Instant::now();
+        let result = self.object_store.get(&self.qualify_path(&path)).await;
 
+        let status = if result.is_ok() {
+            RequestStatus::Success
+        } else {
+            RequestStatus::Error
+        };
+        emit!(StorageRequest {
+            operation: StorageOperation::Get,
+            status,
+        });
+        emit!(StorageRequestDuration {
+            operation: StorageOperation::Get,
+            duration: start.elapsed(),
+        });
+
+        let bytes = result?.bytes().await?;
         Ok(bytes)
     }
 
     /// Get file contents if present, returning None if not found.
     pub async fn get_if_present(&self, path: impl Into<Path>) -> Result<Option<Bytes>> {
         let path: Path = path.into();
-        match self.object_store.get(&self.qualify_path(&path)).await {
+        let start = Instant::now();
+        let result = self.object_store.get(&self.qualify_path(&path)).await;
+
+        let status = match &result {
+            Ok(_) => RequestStatus::Success,
+            Err(object_store::Error::NotFound { .. }) => RequestStatus::Success, // Not found is expected
+            Err(_) => RequestStatus::Error,
+        };
+        emit!(StorageRequest {
+            operation: StorageOperation::Get,
+            status,
+        });
+        emit!(StorageRequestDuration {
+            operation: StorageOperation::Get,
+            duration: start.elapsed(),
+        });
+
+        match result {
             Ok(obj) => {
                 let bytes = obj.bytes().await?;
                 Ok(Some(bytes))
@@ -484,7 +522,24 @@ impl StorageProvider {
     /// Check if a file exists.
     pub async fn exists<P: Into<Path>>(&self, path: P) -> Result<bool> {
         let path: Path = path.into();
-        match self.object_store.head(&self.qualify_path(&path)).await {
+        let start = Instant::now();
+        let result = self.object_store.head(&self.qualify_path(&path)).await;
+
+        let status = match &result {
+            Ok(_) => RequestStatus::Success,
+            Err(object_store::Error::NotFound { .. }) => RequestStatus::Success, // Not found is expected
+            Err(_) => RequestStatus::Error,
+        };
+        emit!(StorageRequest {
+            operation: StorageOperation::Head,
+            status,
+        });
+        emit!(StorageRequestDuration {
+            operation: StorageOperation::Head,
+            duration: start.elapsed(),
+        });
+
+        match result {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
             Err(e) => Err(e.into()),
@@ -496,8 +551,24 @@ impl StorageProvider {
         let bytes = PutPayload::from(Bytes::from(bytes));
         let path = path.into();
         let path = self.qualify_path(&path);
-        self.object_store.put(&path, bytes).await?;
+        let start = Instant::now();
+        let result = self.object_store.put(&path, bytes).await;
 
+        let status = if result.is_ok() {
+            RequestStatus::Success
+        } else {
+            RequestStatus::Error
+        };
+        emit!(StorageRequest {
+            operation: StorageOperation::Put,
+            status,
+        });
+        emit!(StorageRequestDuration {
+            operation: StorageOperation::Put,
+            duration: start.elapsed(),
+        });
+
+        result?;
         Ok(())
     }
 
@@ -522,7 +593,24 @@ impl StorageProvider {
     /// Put a payload to a path.
     pub async fn put_payload(&self, path: &Path, payload: PutPayload) -> Result<()> {
         let path = self.qualify_path(path);
-        self.object_store.put(&path, payload).await?;
+        let start = Instant::now();
+        let result = self.object_store.put(&path, payload).await;
+
+        let status = if result.is_ok() {
+            RequestStatus::Success
+        } else {
+            RequestStatus::Error
+        };
+        emit!(StorageRequest {
+            operation: StorageOperation::Put,
+            status,
+        });
+        emit!(StorageRequestDuration {
+            operation: StorageOperation::Put,
+            duration: start.elapsed(),
+        });
+
+        result?;
         Ok(())
     }
 
@@ -550,7 +638,21 @@ impl StorageProvider {
         let qualified_path = self.qualify_path(path).into_owned();
 
         // Start multipart upload
-        let multipart_id = multipart_store.create_multipart(&qualified_path).await?;
+        let create_start = Instant::now();
+        let create_result = multipart_store.create_multipart(&qualified_path).await;
+        emit!(StorageRequest {
+            operation: StorageOperation::CreateMultipart,
+            status: if create_result.is_ok() {
+                RequestStatus::Success
+            } else {
+                RequestStatus::Error
+            },
+        });
+        emit!(StorageRequestDuration {
+            operation: StorageOperation::CreateMultipart,
+            duration: create_start.elapsed(),
+        });
+        let multipart_id = create_result?;
 
         // Create parts with indices
         let parts: Vec<(usize, Bytes)> = (0..)
@@ -586,9 +688,23 @@ impl StorageProvider {
                     let count = active_parts.fetch_add(1, Ordering::Relaxed) + 1;
                     emit!(ActiveMultipartParts { count });
 
+                    let part_start = Instant::now();
                     let result = multipart_store
                         .put_part(&qualified_path, &multipart_id, idx, data.into())
                         .await;
+
+                    emit!(StorageRequest {
+                        operation: StorageOperation::PutPart,
+                        status: if result.is_ok() {
+                            RequestStatus::Success
+                        } else {
+                            RequestStatus::Error
+                        },
+                    });
+                    emit!(StorageRequestDuration {
+                        operation: StorageOperation::PutPart,
+                        duration: part_start.elapsed(),
+                    });
 
                     let count = active_parts.fetch_sub(1, Ordering::Relaxed) - 1;
                     emit!(ActiveMultipartParts { count });
@@ -608,11 +724,29 @@ impl StorageProvider {
         let part_ids: Vec<PartId> = results.into_iter().map(|(_, id)| id).collect();
 
         // Complete the upload
-        self.multipart_store
+        let complete_start = Instant::now();
+        let complete_result = self
+            .multipart_store
             .as_ref()
             .unwrap()
             .complete_multipart(&qualified_path, &multipart_id, part_ids)
-            .await?;
+            .await;
+
+        emit!(StorageRequest {
+            operation: StorageOperation::CompleteMultipart,
+            status: if complete_result.is_ok() {
+                RequestStatus::Success
+            } else {
+                RequestStatus::Error
+            },
+        });
+        emit!(StorageRequestDuration {
+            operation: StorageOperation::CompleteMultipart,
+            duration: complete_start.elapsed(),
+        });
+
+        complete_result?;
+        emit!(MultipartUploadCompleted);
         debug!("Completed parallel multipart upload for {}", path);
 
         Ok(())

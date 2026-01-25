@@ -14,7 +14,9 @@ use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use crate::emit;
-use crate::internal_events::CheckpointSaveCompleted;
+use crate::internal_events::{
+    CheckpointAge, CheckpointSaveCompleted, CheckpointSaved, PendingFilesCount,
+};
 use crate::source::SourceState;
 use crate::storage::StorageProviderRef;
 
@@ -39,7 +41,9 @@ impl CheckpointManager {
 
     /// Check if a checkpoint should be triggered.
     pub fn should_checkpoint(&self) -> bool {
-        self.last_checkpoint.elapsed() >= self.checkpoint_interval
+        let age = self.last_checkpoint.elapsed().as_secs_f64();
+        emit!(CheckpointAge { seconds: age });
+        age >= self.checkpoint_interval.as_secs_f64()
     }
 
     /// Save a checkpoint.
@@ -71,6 +75,8 @@ impl CheckpointManager {
         emit!(CheckpointSaveCompleted {
             duration: start.elapsed()
         });
+        emit!(CheckpointSaved);
+        emit!(CheckpointAge { seconds: 0.0 });
 
         info!(
             "Saved checkpoint {} with {} files tracked",
@@ -186,6 +192,7 @@ impl CheckpointCoordinator {
     pub async fn clear_pending_files(&self) {
         let mut files = self.pending_files.lock().await;
         files.clear();
+        emit!(PendingFilesCount { count: 0 });
     }
 
     /// Update the Delta version.
@@ -201,9 +208,14 @@ impl CheckpointCoordinator {
 
     /// Trigger a checkpoint.
     pub async fn checkpoint(&self) -> Result<()> {
+        let pending_files = self.pending_files.lock().await.clone();
+        emit!(PendingFilesCount {
+            count: pending_files.len()
+        });
+
         let state = CheckpointState {
             source_state: self.source_state.lock().await.clone(),
-            pending_files: self.pending_files.lock().await.clone(),
+            pending_files,
             in_progress_writes: Vec::new(),
             delta_version: *self.delta_version.lock().await,
         };

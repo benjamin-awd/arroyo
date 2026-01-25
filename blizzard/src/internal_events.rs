@@ -232,6 +232,167 @@ pub struct DecompressionQueueDepth {
 impl InternalEvent for DecompressionQueueDepth {
     fn emit(self) {
         trace!(count = self.count, "Decompression queue depth");
-        gauge!("blizzard_decompression_queue_depth").set(self.count as f64);
+        gauge!("blizzard_rayon_queue_depth").set(self.count as f64);
+    }
+}
+
+// ============================================================================
+// Storage operation events
+// ============================================================================
+
+/// Storage operation types.
+#[derive(Debug, Clone, Copy)]
+pub enum StorageOperation {
+    Get,
+    Put,
+    List,
+    Head,
+    CreateMultipart,
+    PutPart,
+    CompleteMultipart,
+}
+
+impl StorageOperation {
+    fn as_str(&self) -> &'static str {
+        match self {
+            StorageOperation::Get => "get",
+            StorageOperation::Put => "put",
+            StorageOperation::List => "list",
+            StorageOperation::Head => "head",
+            StorageOperation::CreateMultipart => "create_multipart",
+            StorageOperation::PutPart => "put_part",
+            StorageOperation::CompleteMultipart => "complete_multipart",
+        }
+    }
+}
+
+/// Status of a storage request.
+#[derive(Debug, Clone, Copy)]
+pub enum RequestStatus {
+    Success,
+    Error,
+}
+
+impl RequestStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            RequestStatus::Success => "success",
+            RequestStatus::Error => "error",
+        }
+    }
+}
+
+/// Event emitted when a storage request completes.
+pub struct StorageRequest {
+    pub operation: StorageOperation,
+    pub status: RequestStatus,
+}
+
+impl InternalEvent for StorageRequest {
+    fn emit(self) {
+        trace!(
+            operation = self.operation.as_str(),
+            status = self.status.as_str(),
+            "Storage request"
+        );
+        counter!(
+            "blizzard_storage_requests_total",
+            "operation" => self.operation.as_str(),
+            "status" => self.status.as_str()
+        )
+        .increment(1);
+    }
+}
+
+/// Event emitted when a storage request completes with duration.
+pub struct StorageRequestDuration {
+    pub operation: StorageOperation,
+    pub duration: Duration,
+}
+
+impl InternalEvent for StorageRequestDuration {
+    fn emit(self) {
+        trace!(
+            operation = self.operation.as_str(),
+            duration_ms = self.duration.as_millis(),
+            "Storage request duration"
+        );
+        histogram!(
+            "blizzard_storage_request_duration_seconds",
+            "operation" => self.operation.as_str()
+        )
+        .record(self.duration.as_secs_f64());
+    }
+}
+
+/// Event emitted when a multipart upload completes.
+pub struct MultipartUploadCompleted;
+
+impl InternalEvent for MultipartUploadCompleted {
+    fn emit(self) {
+        trace!("Multipart upload completed");
+        counter!("blizzard_multipart_uploads_total").increment(1);
+    }
+}
+
+// ============================================================================
+// Checkpointing & recovery events
+// ============================================================================
+
+/// Event emitted when a checkpoint is saved.
+pub struct CheckpointSaved;
+
+impl InternalEvent for CheckpointSaved {
+    fn emit(self) {
+        trace!("Checkpoint saved");
+        counter!("blizzard_checkpoints_saved_total").increment(1);
+    }
+}
+
+/// Event emitted to track time since last checkpoint.
+pub struct CheckpointAge {
+    pub seconds: f64,
+}
+
+impl InternalEvent for CheckpointAge {
+    fn emit(self) {
+        trace!(seconds = self.seconds, "Checkpoint age");
+        gauge!("blizzard_checkpoint_age_seconds").set(self.seconds);
+    }
+}
+
+/// Event emitted when pending files count changes.
+pub struct PendingFilesCount {
+    pub count: usize,
+}
+
+impl InternalEvent for PendingFilesCount {
+    fn emit(self) {
+        trace!(count = self.count, "Pending files count");
+        gauge!("blizzard_pending_files_count").set(self.count as f64);
+    }
+}
+
+/// Event emitted when records are skipped during recovery.
+pub struct RecoveredRecords {
+    pub count: u64,
+}
+
+impl InternalEvent for RecoveredRecords {
+    fn emit(self) {
+        trace!(count = self.count, "Recovered records");
+        counter!("blizzard_recovered_records_total").increment(self.count);
+    }
+}
+
+/// Event emitted when pending files are committed on startup.
+pub struct RecoveredFiles {
+    pub count: u64,
+}
+
+impl InternalEvent for RecoveredFiles {
+    fn emit(self) {
+        trace!(count = self.count, "Recovered files");
+        counter!("blizzard_recovered_files_total").increment(self.count);
     }
 }

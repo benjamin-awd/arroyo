@@ -15,7 +15,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::emit;
-use crate::internal_events::{ActiveDownloads, ActiveUploads, FileDownloadCompleted};
+use crate::internal_events::{
+    ActiveDownloads, ActiveUploads, FileDownloadCompleted, RecoveredRecords,
+};
 use crate::sink::FinishedFile;
 use crate::sink::delta::DeltaSink;
 use crate::source::SourceState;
@@ -257,6 +259,9 @@ pub(super) async fn run_downloader(
     // Start initial downloads
     for file_path in pending_iter.by_ref().take(max_concurrent) {
         let skip = source_state.records_to_skip(&file_path);
+        if skip > 0 {
+            emit!(RecoveredRecords { count: skip as u64 });
+        }
         let storage = storage.clone();
         active_downloads += 1;
         emit!(ActiveDownloads {
@@ -314,6 +319,9 @@ pub(super) async fn run_downloader(
         // Start next download if available
         if let Some(next_file) = pending_iter.next() {
             let skip = source_state.records_to_skip(&next_file);
+            if skip > 0 {
+                emit!(RecoveredRecords { count: skip as u64 });
+            }
             let storage = storage.clone();
             active_downloads += 1;
             emit!(ActiveDownloads {

@@ -27,7 +27,7 @@ use crate::config::{CompressionFormat, Config, MB};
 use crate::emit;
 use crate::internal_events::{
     BatchesProcessed, BytesWritten, DecompressionQueueDepth, FileProcessed, FileStatus,
-    PendingBatches, RecordsProcessed,
+    PendingBatches, RecordsProcessed, RecoveredFiles,
 };
 use crate::sink::FinishedFile;
 use crate::sink::delta::DeltaSink;
@@ -432,15 +432,16 @@ impl Pipeline {
         // Handle pending files from checkpoint
         if let Some(ref cp) = checkpoint {
             if !cp.pending_files.is_empty() {
-                info!(
-                    "Committing {} pending files from checkpoint",
-                    cp.pending_files.len()
-                );
+                let pending_count = cp.pending_files.len();
+                info!("Committing {} pending files from checkpoint", pending_count);
                 if let Some(version) = delta_sink.recover_pending_files(&cp.pending_files).await? {
                     self.checkpoint_coordinator
                         .update_delta_version(version)
                         .await;
                     self.stats.delta_commits += 1;
+                    emit!(RecoveredFiles {
+                        count: pending_count as u64
+                    });
                 }
                 self.checkpoint_coordinator.clear_pending_files().await;
             }
