@@ -11,66 +11,60 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 # Arrow ecosystem
-arrow = { version = "55", features = ["chrono-tz"] }
-arrow-json = "55"
-parquet = { version = "55", features = ["async"] }
+arrow = { version = "55", default-features = false, features = ["chrono-tz"] }
+arrow-json = { version = "55", default-features = false }
+parquet = { version = "55", default-features = false, features = ["arrow", "async", "snap"] }
 
 # Delta Lake
-deltalake = { version = "0.30", features = ["s3", "gcs", "azure"] }
+deltalake = { version = "0.30", default-features = false, features = ["s3", "gcs"] }
 
 # Object storage
-object_store = { version = "0.12.5", features = ["aws", "gcp", "azure"] }
-aws-config = "1"
+object_store = { version = "0.12.5", default-features = false, features = ["aws", "gcp"] }
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
-tokio-stream = { version = "0.1", features = ["io-util"] }
-tokio-util = { version = "0.7", features = ["io"] }
-async-compression = { version = "0.4", features = ["tokio", "gzip", "zstd"] }
-futures = "0.3"
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "signal"] }
+tokio-util = { version = "0.7", default-features = false, features = ["io"] }
+futures = { version = "0.3", default-features = false, features = ["std"] }
 
 # Decompression
-flate2 = "1"
-zstd = "0.13"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+zstd = { version = "0.13", default-features = false }
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
 serde_yaml = "0.9"
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 
 # Error handling
-anyhow = "1"
-thiserror = "2"
+snafu = { version = "0.8", default-features = false, features = ["std"] }
 
 # Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "ansi"] }
 
-# URL parsing and glob matching
-url = "2"
-regex = "1"
-glob = "0.3"
+# URL parsing
+url = { version = "2", default-features = false }
+regex = { version = "1", default-features = false, features = ["std"] }
 
 # Misc
-bytes = "1"
-uuid = { version = "1", features = ["v7"] }
-chrono = "0.4"
+bytes = { version = "1", default-features = false, features = ["std"] }
+uuid = { version = "1", default-features = false, features = ["v7"] }
 
 # Metrics
-metrics = "0.24"
+metrics = { version = "0.24", default-features = false }
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
-axum = "0.8"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
 
 [dev-dependencies]
 tempfile = "3.24.0"
-criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
-rand = "0.8"
-flate2 = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-bytes = "1"
+criterion = { version = "0.5", default-features = false, features = ["html_reports", "async_tokio"] }
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros"] }
+bytes = { version = "1", default-features = false, features = ["std"] }
 
 [[bench]]
 name = "blizzard_benchmarks"
