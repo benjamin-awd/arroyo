@@ -371,6 +371,7 @@ mod tests {
                     },
                 ],
             },
+            metrics: MetricsConfig::default(),
         };
 
         let schema = config.to_arrow_schema();

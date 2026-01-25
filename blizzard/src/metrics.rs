@@ -1,13 +1,21 @@
 //! Prometheus metrics infrastructure for Blizzard.
+//!
+//! This module provides metrics collection and exposure via HTTP,
+//! following Vector's patterns for observability. It also provides
+//! health endpoints for Kubernetes liveness/readiness probes.
 
 use anyhow::Result;
-use metrics_exporter_prometheus::PrometheusBuilder;
+use axum::{Extension, Router, routing::get};
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::net::SocketAddr;
+use tokio::net::TcpListener;
+use tracing::error;
 
 /// Initialize the Prometheus metrics exporter with an HTTP endpoint.
 ///
-/// This starts an HTTP server on the given address that exposes metrics
-/// in Prometheus format at the `/metrics` endpoint.
+/// This starts an HTTP server on the given address that exposes:
+/// - `/metrics` - Prometheus metrics in text format
+/// - `/health` - Health check endpoint (returns 200 OK)
 ///
 /// # Arguments
 ///
@@ -23,13 +31,45 @@ use std::net::SocketAddr;
 /// metrics::init(addr).expect("Failed to initialize metrics");
 /// ```
 pub fn init(addr: SocketAddr) -> Result<()> {
-    PrometheusBuilder::new()
-        .with_http_listener(addr)
-        .install()?;
+    let handle = PrometheusBuilder::new().install_recorder()?;
+
+    // Spawn the HTTP server in the background
+    tokio::spawn(run_server(addr, handle));
+
     Ok(())
 }
 
-/// Macro for emitting metric events.
+/// Run the HTTP server for metrics and health endpoints.
+async fn run_server(addr: SocketAddr, handle: PrometheusHandle) {
+    let app = Router::new()
+        .route("/metrics", get(metrics_handler))
+        .route("/health", get(health_handler))
+        .layer(Extension(handle));
+
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            error!("Failed to bind metrics server to {}: {}", addr, e);
+            return;
+        }
+    };
+
+    if let Err(e) = axum::serve(listener, app).await {
+        error!("Metrics server error: {}", e);
+    }
+}
+
+/// Handler for `/metrics` endpoint.
+async fn metrics_handler(Extension(handle): Extension<PrometheusHandle>) -> String {
+    handle.render()
+}
+
+/// Handler for `/health` endpoint.
+async fn health_handler() -> &'static str {
+    "ok\n"
+}
+
+/// Macro for emitting metric events (Vector-style pattern).
 ///
 /// This macro is a placeholder for future event emission functionality.
 /// Currently it's a no-op but provides the API surface for instrumenting
