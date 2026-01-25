@@ -3,6 +3,7 @@
 //! Handles loading configuration from YAML files and command-line arguments,
 //! and converts user-defined schemas to Arrow schemas.
 
+mod vars;
 use anyhow::{Result, bail};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use serde::{Deserialize, Serialize};
@@ -219,7 +220,24 @@ pub enum ParquetCompression {
 impl Config {
     /// Load configuration from a YAML file.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
+        Self::from_file_with_options(path, true)
+    }
+
+    /// Load configuration from a YAML file with optional environment variable interpolation.
+    pub fn from_file_with_options(path: impl AsRef<Path>, interpolate_env: bool) -> Result<Self> {
         let content = std::fs::read_to_string(path.as_ref())?;
+
+        let content = if interpolate_env {
+            let result = vars::interpolate(&content);
+            if !result.is_ok() {
+                let error_msg = result.errors.join("\n");
+                bail!("Environment variable interpolation failed:\n{}", error_msg);
+            }
+            result.text
+        } else {
+            content
+        };
+
         let config: Config = serde_yaml::from_str(&content)?;
         config.validate()?;
         Ok(config)
@@ -268,18 +286,6 @@ impl Config {
             .collect();
 
         Arc::new(Schema::new(fields))
-    }
-}
-
-impl SchemaConfig {
-    /// Load schema configuration from a separate YAML file.
-    pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
-        let content = std::fs::read_to_string(path.as_ref())?;
-        let schema: SchemaConfig = serde_yaml::from_str(&content)?;
-        if schema.fields.is_empty() {
-            bail!("Schema must have at least one field");
-        }
-        Ok(schema)
     }
 }
 
