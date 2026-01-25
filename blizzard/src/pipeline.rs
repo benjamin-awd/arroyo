@@ -42,6 +42,11 @@ use crate::utilization::UtilizationTimer;
 
 use tasks::{DownloadedFile, UploaderConfig, run_downloader, run_uploader};
 
+/// Future type for file processing operations.
+type ProcessFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<ProcessedFile, PipelineError>> + Send>,
+>;
+
 /// Statistics about the pipeline run.
 #[derive(Debug, Clone, Default)]
 pub struct PipelineStats {
@@ -221,11 +226,7 @@ impl Pipeline {
         // Consumer: Process downloaded files with parallel decompression
         // Use FuturesUnordered to process multiple files concurrently
         let mut files_remaining = pending_files.len();
-        let mut processing: FuturesUnordered<
-            std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<ProcessedFile, PipelineError>> + Send>,
-            >,
-        > = FuturesUnordered::new();
+        let mut processing: FuturesUnordered<ProcessFuture> = FuturesUnordered::new();
         let mut channel_open = true;
         let mut util_timer = UtilizationTimer::new("processor");
 
@@ -233,9 +234,7 @@ impl Pipeline {
         let spawn_read = |downloaded: DownloadedFile, reader: Arc<NdjsonReader>| {
             let path = downloaded.path.clone();
             let path_for_result = path.clone();
-            let task: std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<ProcessedFile, PipelineError>> + Send>,
-            > = Box::pin(async move {
+            let task: ProcessFuture = Box::pin(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     reader.read(downloaded.compressed_data, downloaded.skip_records, &path)
                 })

@@ -24,6 +24,12 @@ use crate::source::SourceState;
 use crate::storage::{StorageProvider, StorageProviderRef};
 use crate::utilization::UtilizationTimer;
 
+/// Future type for upload operations.
+type UploadFuture = Pin<Box<dyn Future<Output = Result<UploadResult, StorageError>> + Send>>;
+
+/// Future type for download operations.
+type DownloadFuture = Pin<Box<dyn Future<Output = Result<DownloadedFile, StorageError>> + Send>>;
+
 /// Downloaded file ready for processing.
 pub(super) struct DownloadedFile {
     pub path: String,
@@ -89,9 +95,7 @@ pub(super) async fn run_uploader(
     shutdown: CancellationToken,
     config: UploaderConfig,
 ) -> (DeltaSink, usize, usize) {
-    let mut uploads: FuturesUnordered<
-        Pin<Box<dyn Future<Output = Result<UploadResult, StorageError>> + Send>>,
-    > = FuturesUnordered::new();
+    let mut uploads: FuturesUnordered<UploadFuture> = FuturesUnordered::new();
 
     let mut active_uploads = 0;
     let max_concurrent_uploads = config.max_concurrent_uploads;
@@ -262,9 +266,7 @@ pub(super) async fn run_downloader(
     shutdown: CancellationToken,
     max_concurrent: usize,
 ) {
-    let mut downloads: FuturesUnordered<
-        Pin<Box<dyn Future<Output = Result<DownloadedFile, StorageError>> + Send>>,
-    > = FuturesUnordered::new();
+    let mut downloads: FuturesUnordered<DownloadFuture> = FuturesUnordered::new();
 
     let mut pending_iter = pending_files.into_iter();
     let mut active_downloads = 0;

@@ -51,7 +51,7 @@ impl UtilizationTimer {
             waiting: true, // Start in waiting state
             total_wait: Duration::ZERO,
             ewma: Ewma::new(0.9),
-            gauge: gauge!("blizzard_stage_utilization", "stage" => stage),
+            gauge: gauge!("blizzard_utilization", "stage" => stage),
         }
     }
 
