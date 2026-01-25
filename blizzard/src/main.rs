@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use config::Config;
+use config::{Config, MB};
 use pipeline::run_pipeline;
 
 /// NDJSON.gz to Delta Lake streaming tool.
@@ -172,7 +172,7 @@ fn build_config(args: &Args) -> Result<Config> {
         sink: config::SinkConfig {
             path: sink,
             file_size_mb: args.file_size_mb,
-            row_group_size_bytes: 128 * 1024 * 1024, // 128MB default
+            row_group_size_bytes: 128 * MB,
             inactivity_timeout_secs: None,
             rollover_timeout_secs: None,
             part_size_mb: 32,

@@ -10,6 +10,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Byte size constants (binary/IEC units).
+pub const KB: usize = 1024;
+pub const MB: usize = 1024 * KB;
+
 /// Main configuration structure for the pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -106,7 +110,7 @@ fn default_file_size_mb() -> usize {
 }
 
 fn default_row_group_size_bytes() -> usize {
-    128 * 1024 * 1024 // 128MB
+    128 * MB
 }
 
 fn default_part_size_mb() -> usize {
@@ -296,7 +300,7 @@ mod tests {
             sink: SinkConfig {
                 path: "s3://bucket/output/table".to_string(),
                 file_size_mb: 128,
-                row_group_size_bytes: 128 * 1024 * 1024,
+                row_group_size_bytes: 128 * MB,
                 inactivity_timeout_secs: None,
                 rollover_timeout_secs: None,
                 part_size_mb: 32,

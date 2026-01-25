@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use super::FinishedFile;
-use crate::config::ParquetCompression;
+use crate::config::{MB, ParquetCompression};
 
 /// Statistics for tracking writer state.
 #[derive(Debug, Clone, Copy)]
@@ -122,10 +122,10 @@ pub struct ParquetWriterConfig {
 
 impl Default for ParquetWriterConfig {
     fn default() -> Self {
-        let target_file_size = 10 * 1024 * 1024; // 10MB for testing
+        let target_file_size = 128 * MB;
         Self {
             target_file_size,
-            row_group_size_bytes: 128 * 1024 * 1024, // 128MB row group size
+            row_group_size_bytes: 128 * MB,
             compression: ParquetCompression::Snappy,
             rolling_policies: vec![RollingPolicy::SizeLimit(target_file_size)],
         }
@@ -135,7 +135,7 @@ impl Default for ParquetWriterConfig {
 impl ParquetWriterConfig {
     /// Create a new config with a target file size in MB.
     pub fn with_file_size_mb(mut self, size_mb: usize) -> Self {
-        self.target_file_size = size_mb * 1024 * 1024;
+        self.target_file_size = size_mb * MB;
         // Update the default SizeLimit policy if present
         self.rolling_policies = vec![RollingPolicy::SizeLimit(self.target_file_size)];
         self
@@ -185,7 +185,7 @@ impl ParquetWriter {
             config.row_group_size_bytes as f64 / 1024.0 / 1024.0,
             config.rolling_policies
         );
-        let buffer = SharedBuffer::new(64 * 1024 * 1024); // 64MB initial capacity
+        let buffer = SharedBuffer::new(64 * MB);
         let writer = Self::create_writer(&schema, &config, buffer.clone());
         let current_file_name = Self::generate_filename();
 

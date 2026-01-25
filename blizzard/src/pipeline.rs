@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::checkpoint::CheckpointCoordinator;
-use crate::config::{CompressionFormat, Config};
+use crate::config::{CompressionFormat, Config, MB};
 use crate::sink::FinishedFile;
 use crate::sink::delta::DeltaSink;
 use crate::sink::parquet::{ParquetWriter, ParquetWriterConfig, RollingPolicy};
@@ -176,8 +176,8 @@ impl Pipeline {
         let sink_storage = self.sink_storage.clone();
         let upload_shutdown = self.shutdown.clone();
         let uploader_config = UploaderConfig {
-            part_size: self.config.sink.part_size_mb * 1024 * 1024,
-            min_multipart_size: self.config.sink.min_multipart_size_mb * 1024 * 1024,
+            part_size: self.config.sink.part_size_mb * MB,
+            min_multipart_size: self.config.sink.min_multipart_size_mb * MB,
             max_concurrent_uploads,
             max_concurrent_parts: self.config.sink.max_concurrent_parts,
         };
@@ -464,7 +464,7 @@ impl Pipeline {
         let mut policies = Vec::new();
 
         // Always include size-based rolling
-        let size_bytes = self.config.sink.file_size_mb * 1024 * 1024;
+        let size_bytes = self.config.sink.file_size_mb * MB;
         policies.push(RollingPolicy::SizeLimit(size_bytes));
 
         // Add inactivity timeout if configured
