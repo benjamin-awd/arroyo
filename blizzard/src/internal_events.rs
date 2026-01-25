@@ -1,4 +1,4 @@
-//! Internal events for metrics emission following Vector's pattern.
+//! Internal events for metrics emission.
 //!
 //! Each event struct represents a measurable occurrence in the pipeline.
 //! Events implement the `InternalEvent` trait which emits the corresponding

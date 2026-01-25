@@ -22,6 +22,7 @@ use crate::sink::FinishedFile;
 use crate::sink::delta::DeltaSink;
 use crate::source::SourceState;
 use crate::storage::{StorageProvider, StorageProviderRef};
+use crate::utilization::UtilizationTimer;
 
 /// Downloaded file ready for processing.
 pub(super) struct DownloadedFile {
@@ -97,6 +98,7 @@ pub(super) async fn run_uploader(
     let mut bytes_uploaded = 0usize;
     let mut files_to_commit: Vec<FinishedFile> = Vec::new();
     let mut channel_open = true;
+    let mut util_timer = UtilizationTimer::new("blizzard_uploader_utilization");
 
     const COMMIT_BATCH_SIZE: usize = 10;
 
@@ -143,6 +145,12 @@ pub(super) async fn run_uploader(
             break;
         }
 
+        // Update utilization state: waiting if no active uploads
+        if active_uploads == 0 {
+            util_timer.start_wait();
+        }
+        util_timer.maybe_update();
+
         tokio::select! {
             biased;
 
@@ -187,6 +195,10 @@ pub(super) async fn run_uploader(
             result = upload_rx.recv(), if active_uploads < max_concurrent_uploads && channel_open => {
                 match result {
                     Some(file) => {
+                        // Transition to working state when we have uploads
+                        if active_uploads == 0 {
+                            util_timer.stop_wait();
+                        }
                         active_uploads += 1;
                         emit!(ActiveUploads {
                             count: active_uploads
@@ -255,6 +267,7 @@ pub(super) async fn run_downloader(
 
     let mut pending_iter = pending_files.into_iter();
     let mut active_downloads = 0;
+    let mut util_timer = UtilizationTimer::new("blizzard_downloader_utilization");
 
     // Start initial downloads
     for file_path in pending_iter.by_ref().take(max_concurrent) {
@@ -263,6 +276,10 @@ pub(super) async fn run_downloader(
             emit!(RecoveredRecords { count: skip as u64 });
         }
         let storage = storage.clone();
+        // First download starts working state
+        if active_downloads == 0 {
+            util_timer.stop_wait();
+        }
         active_downloads += 1;
         emit!(ActiveDownloads {
             count: active_downloads
@@ -276,6 +293,8 @@ pub(super) async fn run_downloader(
 
     // Process downloads and start new ones as they complete
     while let Some(result) = downloads.next().await {
+        util_timer.maybe_update();
+
         if shutdown.is_cancelled() {
             debug!("[download] Shutdown requested, stopping downloads");
             break;
@@ -285,6 +304,11 @@ pub(super) async fn run_downloader(
         emit!(ActiveDownloads {
             count: active_downloads
         });
+
+        // Update utilization state: waiting if no active downloads
+        if active_downloads == 0 {
+            util_timer.start_wait();
+        }
 
         // Send result to consumer (decompress+parse)
         let should_continue = match &result {
@@ -323,6 +347,10 @@ pub(super) async fn run_downloader(
                 emit!(RecoveredRecords { count: skip as u64 });
             }
             let storage = storage.clone();
+            // Transition to working state when we have downloads
+            if active_downloads == 0 {
+                util_timer.stop_wait();
+            }
             active_downloads += 1;
             emit!(ActiveDownloads {
                 count: active_downloads

@@ -1,8 +1,7 @@
 //! Prometheus metrics infrastructure for Blizzard.
 //!
-//! This module provides metrics collection and exposure via HTTP,
-//! following Vector's patterns for observability. It also provides
-//! health endpoints for Kubernetes liveness/readiness probes.
+//! This module provides metrics collection and exposure via HTTP.
+//! It also provides health endpoints for Kubernetes liveness/readiness probes.
 
 use anyhow::Result;
 use axum::{Extension, Router, routing::get};

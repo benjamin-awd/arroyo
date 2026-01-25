@@ -12,6 +12,7 @@ mod pipeline;
 mod sink;
 mod source;
 mod storage;
+mod utilization;
 
 use anyhow::Result;
 use clap::Parser;

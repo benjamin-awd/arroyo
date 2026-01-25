@@ -34,6 +34,7 @@ use crate::sink::delta::DeltaSink;
 use crate::sink::parquet::{ParquetWriter, ParquetWriterConfig, RollingPolicy};
 use crate::source::{NdjsonReader, NdjsonReaderConfig};
 use crate::storage::{StorageProvider, StorageProviderRef, list_ndjson_files};
+use crate::utilization::UtilizationTimer;
 
 use tasks::{DownloadedFile, UploaderConfig, run_downloader, run_uploader};
 
@@ -217,6 +218,7 @@ impl Pipeline {
             std::pin::Pin<Box<dyn std::future::Future<Output = Result<ProcessedFile>> + Send>>,
         > = FuturesUnordered::new();
         let mut channel_open = true;
+        let mut util_timer = UtilizationTimer::new("blizzard_processor_utilization");
 
         // Helper to spawn a read task (decompress + parse)
         let spawn_read = |downloaded: DownloadedFile, reader: Arc<NdjsonReader>| {
@@ -239,6 +241,12 @@ impl Pipeline {
         };
 
         loop {
+            // Update utilization state: waiting if no processing tasks
+            if processing.is_empty() {
+                util_timer.start_wait();
+            }
+            util_timer.maybe_update();
+
             if self.shutdown.is_cancelled() {
                 info!("Shutdown requested, stopping processing");
                 self.checkpoint_coordinator.checkpoint().await?;
@@ -260,6 +268,10 @@ impl Pipeline {
                 result = download_rx.recv(), if has_capacity => {
                     match result {
                         Some(Ok(downloaded)) => {
+                            // Transition to working state when we have processing tasks
+                            if processing.is_empty() {
+                                util_timer.stop_wait();
+                            }
                             processing.push(spawn_read(downloaded, reader.clone()));
                             emit!(DecompressionQueueDepth {
                                 count: processing.len()
