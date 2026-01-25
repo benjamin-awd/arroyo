@@ -6,6 +6,7 @@
 
 mod checkpoint;
 mod config;
+mod metrics;
 mod pipeline;
 mod sink;
 mod source;
@@ -55,6 +56,16 @@ async fn main() -> Result<()> {
 
     // Load or build configuration
     let config = build_config(&args)?;
+
+    // Initialize metrics if enabled
+    if config.metrics.enabled {
+        let addr = config.metrics.address.parse()?;
+        metrics::init(addr)?;
+        info!(
+            "Metrics endpoint listening on http://{}/metrics",
+            config.metrics.address
+        );
+    }
 
     if args.dry_run {
         info!("Dry run mode - validating configuration");

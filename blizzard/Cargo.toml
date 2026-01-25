@@ -10,15 +10,15 @@ license = "MIT OR Apache-2.0"
 [workspace]
 
 [dependencies]
-# Arrow ecosystem (latest)
+# Arrow ecosystem
 arrow = { version = "55", features = ["chrono-tz"] }
 arrow-json = "55"
 parquet = { version = "55", features = ["async"] }
 
-# Delta Lake (latest)
+# Delta Lake
 deltalake = { version = "0.30", features = ["s3", "gcs", "azure"] }
 
-# Object storage (patched via [patch.crates-io] for GCS Content-Length header fix)
+# Object storage
 object_store = { version = "0.12.5", features = ["aws", "gcp", "azure"] }
 aws-config = "1"
 
@@ -59,6 +59,10 @@ glob = "0.3"
 bytes = "1"
 uuid = { version = "1", features = ["v7"] }
 chrono = "0.4"
+
+# Metrics
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
 
 [dev-dependencies]
 tempfile = "3.24.0"

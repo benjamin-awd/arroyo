@@ -20,6 +20,7 @@
 
 pub mod checkpoint;
 pub mod config;
+pub mod metrics;
 pub mod pipeline;
 pub mod sink;
 pub mod source;

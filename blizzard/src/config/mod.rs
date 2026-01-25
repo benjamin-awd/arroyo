@@ -22,6 +22,37 @@ pub struct Config {
     pub sink: SinkConfig,
     pub checkpoint: CheckpointConfig,
     pub schema: SchemaConfig,
+    /// Metrics configuration (optional, enabled by default).
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+/// Metrics configuration for Prometheus endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    /// Whether metrics collection is enabled (default: true).
+    #[serde(default = "default_metrics_enabled")]
+    pub enabled: bool,
+    /// Address to bind the metrics HTTP server (default: "0.0.0.0:9090").
+    #[serde(default = "default_metrics_address")]
+    pub address: String,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_metrics_enabled(),
+            address: default_metrics_address(),
+        }
+    }
+}
+
+fn default_metrics_enabled() -> bool {
+    true
+}
+
+fn default_metrics_address() -> String {
+    "0.0.0.0:9090".to_string()
 }
 
 /// Source configuration for reading NDJSON files.
