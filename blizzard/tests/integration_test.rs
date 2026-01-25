@@ -136,7 +136,7 @@ mod storage_tests {
     fn test_gcs_url_parsing() {
         let config = BackendConfig::parse_url("gs://mybucket/path/to/data", false).unwrap();
         match config {
-            BackendConfig::GCS(gcs) => {
+            BackendConfig::Gcs(gcs) => {
                 assert_eq!(gcs.bucket, "mybucket");
             }
             _ => panic!("Expected GCS config"),
@@ -309,5 +309,125 @@ mod sink_tests {
         assert_eq!(file.filename, "data-001.parquet");
         assert_eq!(file.size, 1024 * 1024);
         assert_eq!(file.record_count, 10000);
+    }
+}
+
+mod delta_recovery_tests {
+    use arrow::datatypes::{DataType, Field, Schema};
+    use blizzard::checkpoint::PendingFile;
+    use blizzard::sink::delta::DeltaSink;
+    use blizzard::storage::StorageProvider;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn test_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, true),
+        ])
+    }
+
+    #[tokio::test]
+    async fn test_recover_pending_files_commits_to_delta() {
+        let temp_dir = TempDir::new().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        // Create storage provider for local path
+        let storage = Arc::new(
+            StorageProvider::for_url_with_options(table_path, HashMap::new())
+                .await
+                .unwrap(),
+        );
+
+        // Create Delta sink (creates the table)
+        let schema = test_schema();
+        let mut delta_sink = DeltaSink::new(storage, &schema).await.unwrap();
+
+        // Initial version should be 0 (newly created table)
+        let initial_version = delta_sink.version();
+
+        // Simulate pending files from checkpoint recovery
+        let pending_files = vec![
+            PendingFile {
+                filename: "part-00000.parquet".to_string(),
+                record_count: 100,
+            },
+            PendingFile {
+                filename: "part-00001.parquet".to_string(),
+                record_count: 200,
+            },
+        ];
+
+        // Recover pending files
+        let result = delta_sink.recover_pending_files(&pending_files).await;
+        assert!(result.is_ok(), "Recovery should succeed");
+
+        let new_version = result.unwrap();
+        assert!(new_version.is_some(), "Should return new version");
+        assert!(
+            new_version.unwrap() > initial_version,
+            "Version should increase after commit"
+        );
+
+        // Verify delta_sink's internal version was updated
+        assert_eq!(delta_sink.version(), new_version.unwrap());
+
+        // Independently verify files were committed by opening the table directly
+        let table_url = url::Url::parse(&format!("file://{}", table_path)).unwrap();
+        let table = deltalake::open_table(table_url).await.unwrap();
+
+        let committed_files: Vec<String> = table
+            .get_file_uris()
+            .unwrap()
+            .map(|p| p.to_string())
+            .collect();
+
+        assert_eq!(
+            committed_files.len(),
+            2,
+            "Should have exactly 2 committed files"
+        );
+        assert!(
+            committed_files
+                .iter()
+                .any(|f| f.ends_with("part-00000.parquet")),
+            "part-00000.parquet should be in committed files, got: {:?}",
+            committed_files
+        );
+        assert!(
+            committed_files
+                .iter()
+                .any(|f| f.ends_with("part-00001.parquet")),
+            "part-00001.parquet should be in committed files, got: {:?}",
+            committed_files
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recover_empty_pending_files_returns_none() {
+        let temp_dir = TempDir::new().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let storage = Arc::new(
+            StorageProvider::for_url_with_options(table_path, HashMap::new())
+                .await
+                .unwrap(),
+        );
+        let schema = test_schema();
+        let mut delta_sink = DeltaSink::new(storage, &schema).await.unwrap();
+
+        let initial_version = delta_sink.version();
+
+        // Recover with empty list
+        let result = delta_sink.recover_pending_files(&[]).await;
+        assert!(result.is_ok());
+        assert!(
+            result.unwrap().is_none(),
+            "Empty recovery should return None"
+        );
+
+        // Version should not change
+        assert_eq!(delta_sink.version(), initial_version);
     }
 }

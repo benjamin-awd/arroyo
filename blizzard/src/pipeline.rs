@@ -11,12 +11,11 @@
 //!
 //! This enables full CPU utilization during gzip decompression.
 
+mod tasks;
+
 use anyhow::Result;
 use arrow::array::RecordBatch;
-use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -31,6 +30,8 @@ use crate::sink::parquet::{ParquetWriter, ParquetWriterConfig, RollingPolicy};
 use crate::source::{NdjsonReader, NdjsonReaderConfig};
 use crate::storage::{StorageProvider, StorageProviderRef, list_ndjson_files};
 
+use tasks::{DownloadedFile, UploaderConfig, run_downloader, run_uploader};
+
 /// Statistics about the pipeline run.
 #[derive(Debug, Clone, Default)]
 pub struct PipelineStats {
@@ -42,25 +43,11 @@ pub struct PipelineStats {
     pub checkpoints_saved: usize,
 }
 
-/// Downloaded file ready for processing.
-struct DownloadedFile {
-    path: String,
-    compressed_data: Bytes,
-    skip_records: usize,
-}
-
 /// Result of processing a downloaded file.
 struct ProcessedFile {
     path: String,
     batches: Vec<RecordBatch>,
     total_records: usize,
-}
-
-/// Result of uploading a file.
-struct UploadResult {
-    filename: String,
-    size: usize,
-    record_count: usize,
 }
 
 /// Initialized pipeline state ready for processing.
@@ -183,159 +170,25 @@ impl Pipeline {
         // Larger buffer to allow more queuing and avoid blocking the writer
         let max_concurrent_uploads = self.config.sink.max_concurrent_uploads;
         let buffer_size = max_concurrent_uploads * 4;
-        let (upload_tx, mut upload_rx) = mpsc::channel::<FinishedFile>(buffer_size);
+        let (upload_tx, upload_rx) = mpsc::channel::<FinishedFile>(buffer_size);
 
         // Spawn background uploader task with concurrent file uploads
         let sink_storage = self.sink_storage.clone();
         let upload_shutdown = self.shutdown.clone();
-        let part_size = self.config.sink.part_size_mb * 1024 * 1024;
-        let min_multipart_size = self.config.sink.min_multipart_size_mb * 1024 * 1024;
-        let max_concurrent_parts = self.config.sink.max_concurrent_parts;
+        let uploader_config = UploaderConfig {
+            part_size: self.config.sink.part_size_mb * 1024 * 1024,
+            min_multipart_size: self.config.sink.min_multipart_size_mb * 1024 * 1024,
+            max_concurrent_uploads,
+            max_concurrent_parts: self.config.sink.max_concurrent_parts,
+        };
 
-        let upload_handle = tokio::spawn(async move {
-            let mut delta_sink = delta_sink;
-            let mut uploads: FuturesUnordered<
-                Pin<Box<dyn Future<Output = Result<UploadResult>> + Send>>,
-            > = FuturesUnordered::new();
-
-            let mut active_uploads = 0;
-            let mut files_uploaded = 0usize;
-            let mut bytes_uploaded = 0usize;
-            let mut files_to_commit: Vec<FinishedFile> = Vec::new();
-            let mut channel_open = true;
-
-            const COMMIT_BATCH_SIZE: usize = 10;
-
-            // Helper to commit accumulated files
-            async fn commit_files(
-                delta_sink: &mut DeltaSink,
-                files_to_commit: &mut Vec<FinishedFile>,
-            ) -> usize {
-                if files_to_commit.is_empty() {
-                    return 0;
-                }
-
-                let commit_files: Vec<FinishedFile> = files_to_commit
-                    .drain(..)
-                    .map(|f| FinishedFile {
-                        filename: f.filename,
-                        size: f.size,
-                        record_count: f.record_count,
-                        bytes: None, // Clear bytes for commit
-                    })
-                    .collect();
-
-                let count = commit_files.len();
-                match delta_sink.commit_files(&commit_files).await {
-                    Ok(Some(version)) => {
-                        info!(
-                            "Committed {} files to Delta Lake, version {}",
-                            count, version
-                        );
-                    }
-                    Ok(None) => {
-                        debug!("No commit needed (duplicate files)");
-                    }
-                    Err(e) => {
-                        error!("Failed to commit {} files to Delta: {}", count, e);
-                    }
-                }
-                count
-            }
-
-            loop {
-                // Check if we're done: channel closed, no pending uploads, no files to commit
-                if !channel_open && uploads.is_empty() {
-                    break;
-                }
-
-                tokio::select! {
-                    biased;
-
-                    _ = upload_shutdown.cancelled() => {
-                        info!("[upload] Shutdown requested, stopping uploads");
-                        break;
-                    }
-
-                    // Handle completed uploads
-                    Some(result) = uploads.next(), if !uploads.is_empty() => {
-                        active_uploads -= 1;
-                        match result {
-                            Ok(upload_result) => {
-                                debug!(
-                                    "[upload] Completed {} (active: {})",
-                                    upload_result.filename, active_uploads
-                                );
-                                files_uploaded += 1;
-                                bytes_uploaded += upload_result.size;
-                                files_to_commit.push(FinishedFile {
-                                    filename: upload_result.filename,
-                                    size: upload_result.size,
-                                    record_count: upload_result.record_count,
-                                    bytes: None,
-                                });
-
-                                // Batch commit every N files
-                                if files_to_commit.len() >= COMMIT_BATCH_SIZE {
-                                    commit_files(&mut delta_sink, &mut files_to_commit).await;
-                                }
-                            }
-                            Err(e) => {
-                                error!("[upload] Upload failed: {}", e);
-                            }
-                        }
-                    }
-
-                    // Accept new files if under concurrency limit
-                    result = upload_rx.recv(), if active_uploads < max_concurrent_uploads && channel_open => {
-                        match result {
-                            Some(file) => {
-                                active_uploads += 1;
-                                info!(
-                                    "[upload] Starting {} ({} bytes, {} records, active: {})",
-                                    file.filename, file.size, file.record_count, active_uploads
-                                );
-                                uploads.push(Box::pin(upload_file(
-                                    sink_storage.clone(),
-                                    file,
-                                    part_size,
-                                    min_multipart_size,
-                                    max_concurrent_parts,
-                                )));
-                            }
-                            None => {
-                                // Channel closed, but continue draining uploads
-                                channel_open = false;
-                                debug!("[upload] Channel closed, draining {} pending uploads", uploads.len());
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Drain any remaining pending uploads
-            while let Some(result) = uploads.next().await {
-                if let Ok(upload_result) = result {
-                    files_uploaded += 1;
-                    bytes_uploaded += upload_result.size;
-                    files_to_commit.push(FinishedFile {
-                        filename: upload_result.filename,
-                        size: upload_result.size,
-                        record_count: upload_result.record_count,
-                        bytes: None,
-                    });
-                }
-            }
-
-            // Final commit
-            commit_files(&mut delta_sink, &mut files_to_commit).await;
-
-            info!(
-                "Uploader finished: {} files, {} bytes",
-                files_uploaded, bytes_uploaded
-            );
-            (delta_sink, files_uploaded, bytes_uploaded)
-        });
+        let upload_handle = tokio::spawn(run_uploader(
+            upload_rx,
+            delta_sink,
+            sink_storage,
+            upload_shutdown,
+            uploader_config,
+        ));
 
         // Spawn download tasks concurrently using FuturesUnordered
         let storage = self.source_storage.clone();
@@ -343,80 +196,14 @@ impl Pipeline {
         let pending_files_clone = pending_files.clone();
         let shutdown = self.shutdown.clone();
 
-        let download_handle = tokio::spawn(async move {
-            let mut downloads: FuturesUnordered<
-                std::pin::Pin<Box<dyn std::future::Future<Output = Result<DownloadedFile>> + Send>>,
-            > = FuturesUnordered::new();
-
-            let mut pending_iter = pending_files_clone.into_iter();
-            let mut active_downloads = 0;
-
-            // Start initial downloads
-            for file_path in pending_iter.by_ref().take(max_concurrent) {
-                let skip = source_state_clone.records_to_skip(&file_path);
-                let storage = storage.clone();
-                active_downloads += 1;
-                debug!(
-                    "[download] Starting {} (active: {})",
-                    file_path, active_downloads
-                );
-                downloads.push(Box::pin(Self::download_file(storage, file_path, skip)));
-            }
-
-            // Process downloads and start new ones as they complete
-            while let Some(result) = downloads.next().await {
-                if shutdown.is_cancelled() {
-                    debug!("[download] Shutdown requested, stopping downloads");
-                    break;
-                }
-
-                active_downloads -= 1;
-
-                // Send result to consumer (decompress+parse)
-                let should_continue = match &result {
-                    Ok(downloaded) => {
-                        debug!(
-                            "[download] Completed {} ({} bytes)",
-                            downloaded.path,
-                            downloaded.compressed_data.len()
-                        );
-                        true
-                    }
-                    Err(e) => {
-                        let error_str = e.to_string();
-                        // Skip 404 errors, propagate others
-                        if error_str.contains("not found")
-                            || error_str.contains("404")
-                            || error_str.contains("NoSuchKey")
-                        {
-                            warn!("[download] Skipping missing file: {}", e);
-                            false // Don't send error, just skip
-                        } else {
-                            true // Send error to consumer
-                        }
-                    }
-                };
-
-                if should_continue && download_tx.send(result).await.is_err() {
-                    debug!("[download] Consumer closed, stopping downloads");
-                    break;
-                }
-
-                // Start next download if available
-                if let Some(next_file) = pending_iter.next() {
-                    let skip = source_state_clone.records_to_skip(&next_file);
-                    let storage = storage.clone();
-                    active_downloads += 1;
-                    debug!(
-                        "[download] Starting {} (active: {})",
-                        next_file, active_downloads
-                    );
-                    downloads.push(Box::pin(Self::download_file(storage, next_file, skip)));
-                }
-            }
-
-            debug!("[download] All downloads complete");
-        });
+        let download_handle = tokio::spawn(run_downloader(
+            pending_files_clone,
+            source_state_clone,
+            storage,
+            download_tx,
+            shutdown,
+            max_concurrent,
+        ));
 
         // Consumer: Process downloaded files with parallel decompression
         // Use FuturesUnordered to process multiple files concurrently
@@ -621,18 +408,7 @@ impl Pipeline {
                     "Committing {} pending files from checkpoint",
                     cp.pending_files.len()
                 );
-                let finished_files: Vec<FinishedFile> = cp
-                    .pending_files
-                    .iter()
-                    .map(|pf| FinishedFile {
-                        filename: pf.filename.clone(),
-                        size: 0, // Size is not critical for commit
-                        record_count: pf.record_count,
-                        bytes: None, // Files already uploaded, just need to commit
-                    })
-                    .collect();
-
-                if let Some(version) = delta_sink.commit_files(&finished_files).await? {
+                if let Some(version) = delta_sink.recover_pending_files(&cp.pending_files).await? {
                     self.checkpoint_coordinator
                         .update_delta_version(version)
                         .await;
@@ -710,55 +486,6 @@ impl Pipeline {
     async fn list_source_files(&self) -> Result<Vec<String>> {
         list_ndjson_files(&self.source_storage).await
     }
-
-    /// Download a file's compressed data asynchronously.
-    async fn download_file(
-        storage: StorageProviderRef,
-        path: String,
-        skip_records: usize,
-    ) -> Result<DownloadedFile> {
-        let compressed_data = storage.get(path.as_str()).await?;
-        Ok(DownloadedFile {
-            path,
-            compressed_data,
-            skip_records,
-        })
-    }
-}
-
-/// Upload a single file to storage with parallel part uploads.
-async fn upload_file(
-    storage: Arc<StorageProvider>,
-    file: FinishedFile,
-    part_size: usize,
-    min_multipart_size: usize,
-    max_concurrent_parts: usize,
-) -> Result<UploadResult> {
-    let Some(bytes) = file.bytes else {
-        // No bytes means the file was already uploaded (e.g., from checkpoint recovery)
-        return Ok(UploadResult {
-            filename: file.filename,
-            size: file.size,
-            record_count: file.record_count,
-        });
-    };
-
-    let path = object_store::path::Path::from(file.filename.as_str());
-    storage
-        .put_multipart_bytes_parallel(
-            &path,
-            bytes,
-            part_size,
-            min_multipart_size,
-            max_concurrent_parts,
-        )
-        .await?;
-
-    Ok(UploadResult {
-        filename: file.filename,
-        size: file.size,
-        record_count: file.record_count,
-    })
 }
 
 /// Run the pipeline with the given configuration.

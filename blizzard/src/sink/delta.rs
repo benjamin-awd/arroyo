@@ -15,6 +15,7 @@ use tracing::{debug, info};
 use url::Url;
 
 use super::FinishedFile;
+use crate::checkpoint::PendingFile;
 use crate::storage::{BackendConfig, StorageProvider, StorageProviderRef};
 
 /// Delta Lake sink for committing Parquet files.
@@ -64,6 +65,28 @@ impl DeltaSink {
     /// Get the current table version.
     pub fn version(&self) -> i64 {
         self.last_version
+    }
+
+    /// Recover pending files from checkpoint by committing to Delta.
+    ///
+    /// These files were uploaded but not committed (e.g., crash after upload).
+    /// Returns new version if files were committed.
+    pub async fn recover_pending_files(&mut self, pending: &[PendingFile]) -> Result<Option<i64>> {
+        if pending.is_empty() {
+            return Ok(None);
+        }
+
+        let finished_files: Vec<FinishedFile> = pending
+            .iter()
+            .map(|pf| FinishedFile {
+                filename: pf.filename.clone(),
+                size: 0,
+                record_count: pf.record_count,
+                bytes: None,
+            })
+            .collect();
+
+        self.commit_files(&finished_files).await
     }
 }
 
@@ -346,5 +369,40 @@ mod tests {
             }
             _ => panic!("Expected Add action"),
         }
+    }
+
+    #[test]
+    fn test_pending_file_to_finished_file_conversion() {
+        // Test the conversion logic used in recover_pending_files
+        let pending = vec![
+            PendingFile {
+                filename: "file1.parquet".to_string(),
+                record_count: 100,
+            },
+            PendingFile {
+                filename: "/path/to/file2.parquet".to_string(),
+                record_count: 200,
+            },
+        ];
+
+        let finished: Vec<FinishedFile> = pending
+            .iter()
+            .map(|pf| FinishedFile {
+                filename: pf.filename.clone(),
+                size: 0,
+                record_count: pf.record_count,
+                bytes: None,
+            })
+            .collect();
+
+        assert_eq!(finished.len(), 2);
+
+        assert_eq!(finished[0].filename, "file1.parquet");
+        assert_eq!(finished[0].size, 0);
+        assert_eq!(finished[0].record_count, 100);
+        assert!(finished[0].bytes.is_none());
+
+        assert_eq!(finished[1].filename, "/path/to/file2.parquet");
+        assert_eq!(finished[1].record_count, 200);
     }
 }
