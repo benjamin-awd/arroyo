@@ -98,7 +98,7 @@ pub(super) async fn run_uploader(
     let mut bytes_uploaded = 0usize;
     let mut files_to_commit: Vec<FinishedFile> = Vec::new();
     let mut channel_open = true;
-    let mut util_timer = UtilizationTimer::new("blizzard_uploader_utilization");
+    let mut util_timer = UtilizationTimer::new("uploader");
 
     const COMMIT_BATCH_SIZE: usize = 10;
 
@@ -267,7 +267,7 @@ pub(super) async fn run_downloader(
 
     let mut pending_iter = pending_files.into_iter();
     let mut active_downloads = 0;
-    let mut util_timer = UtilizationTimer::new("blizzard_downloader_utilization");
+    let mut util_timer = UtilizationTimer::new("downloader");
 
     // Start initial downloads
     for file_path in pending_iter.by_ref().take(max_concurrent) {

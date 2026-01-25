@@ -43,7 +43,7 @@ pub struct UtilizationTimer {
 }
 
 impl UtilizationTimer {
-    pub fn new(metric_name: &'static str) -> Self {
+    pub fn new(stage: &'static str) -> Self {
         let now = Instant::now();
         Self {
             overall_start: now,
@@ -51,7 +51,7 @@ impl UtilizationTimer {
             waiting: true, // Start in waiting state
             total_wait: Duration::ZERO,
             ewma: Ewma::new(0.9),
-            gauge: gauge!(metric_name),
+            gauge: gauge!("blizzard_stage_utilization", "stage" => stage),
         }
     }
 

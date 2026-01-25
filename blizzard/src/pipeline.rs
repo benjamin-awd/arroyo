@@ -218,7 +218,7 @@ impl Pipeline {
             std::pin::Pin<Box<dyn std::future::Future<Output = Result<ProcessedFile>> + Send>>,
         > = FuturesUnordered::new();
         let mut channel_open = true;
-        let mut util_timer = UtilizationTimer::new("blizzard_processor_utilization");
+        let mut util_timer = UtilizationTimer::new("processor");
 
         // Helper to spawn a read task (decompress + parse)
         let spawn_read = |downloaded: DownloadedFile, reader: Arc<NdjsonReader>| {
