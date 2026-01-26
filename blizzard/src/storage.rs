@@ -81,6 +81,15 @@ enum Backend {
     Local,
 }
 
+/// Create a standard retry configuration for cloud storage operations.
+///
+/// Handles transient errors like 500s, rate limits, and network timeouts
+/// with exponential backoff. Uses object_store defaults (max_retries: 10,
+/// retry_timeout: 3 minutes).
+fn default_retry_config() -> RetryConfig {
+    RetryConfig::default()
+}
+
 fn matchers() -> &'static HashMap<Backend, Vec<Regex>> {
     static MATCHERS: OnceLock<HashMap<Backend, Vec<Regex>>> = OnceLock::new();
     MATCHERS.get_or_init(|| {
@@ -319,12 +328,7 @@ impl StorageProvider {
             builder = builder.with_config(key.parse().context(S3ConfigSnafu)?, value.clone());
         }
 
-        // Disable retries; we handle our own
-        let retry_config = RetryConfig {
-            max_retries: 0,
-            ..Default::default()
-        };
-        builder = builder.with_retry(retry_config);
+        builder = builder.with_retry(default_retry_config());
 
         if let Some(region) = &config.region {
             builder = builder.with_region(region);
@@ -366,11 +370,7 @@ impl StorageProvider {
     async fn construct_gcs(config: GcsConfig) -> Result<Self, StorageError> {
         let mut builder = GoogleCloudStorageBuilder::from_env().with_bucket_name(&config.bucket);
 
-        let retry_config = RetryConfig {
-            max_retries: 0,
-            ..Default::default()
-        };
-        builder = builder.with_retry(retry_config);
+        builder = builder.with_retry(default_retry_config());
 
         if let Ok(service_account_key) = std::env::var("GOOGLE_SERVICE_ACCOUNT_KEY") {
             debug!("Constructing GCS builder with service account key");
@@ -397,7 +397,9 @@ impl StorageProvider {
     }
 
     async fn construct_azure(config: AzureConfig) -> Result<Self, StorageError> {
-        let builder = MicrosoftAzureBuilder::from_env().with_container_name(&config.container);
+        let builder = MicrosoftAzureBuilder::from_env()
+            .with_container_name(&config.container)
+            .with_retry(default_retry_config());
 
         let canonical_url = format!(
             "https://{}.blob.core.windows.net/{}",
